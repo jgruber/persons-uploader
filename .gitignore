@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# App runtime files
+uploads/
+credentials.json
+.env
+
+# OS
+.DS_Store
+Thumbs.db
