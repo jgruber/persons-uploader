@@ -4,11 +4,19 @@ import secrets
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
 
 app = FastAPI(title="Persons Uploader")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_headers=["Authorization"],
+    allow_methods=["GET"],
+)
 security = HTTPBasic()
 
 # ---------------------------------------------------------------------------
