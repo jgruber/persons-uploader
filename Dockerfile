@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY main.py .
 COPY templates/ templates/
+COPY static/ static/
 
 # Create the default upload directory
 RUN mkdir -p /data/uploads

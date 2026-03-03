@@ -8,9 +8,5 @@ services:
       AUTH_PASSWORD: ${AUTH_PASSWORD:-changeme}
       UPLOAD_DIR: /data/uploads
     volumes:
-      - uploads:/data/uploads
-      - creds:/app/credentials.json
-
-volumes:
-  uploads:
-  creds:
+      - ./uploads:/data/uploads
+      - ./credentials.json:/app/credentials.json
