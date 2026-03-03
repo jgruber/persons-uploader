@@ -1,0 +1,16 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      AUTH_USERNAME: ${AUTH_USERNAME:-admin}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-changeme}
+      UPLOAD_DIR: /data/uploads
+    volumes:
+      - uploads:/data/uploads
+      - creds:/app/credentials.json
+
+volumes:
+  uploads:
+  creds:
