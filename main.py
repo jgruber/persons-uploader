@@ -2,6 +2,7 @@ import json
 import os
 import secrets
 from pathlib import Path
+from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
 
 app = FastAPI(title="Persons Uploader")
+security = HTTPBasic()
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,10 +19,9 @@ app.add_middleware(
     allow_headers=["Authorization"],
     allow_methods=["GET"],
 )
-security = HTTPBasic()
 
 # ---------------------------------------------------------------------------
-# Configuration – override via environment variables
+# Configuration
 # ---------------------------------------------------------------------------
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 CREDENTIALS_FILE = Path("credentials.json")
@@ -31,52 +32,75 @@ templates = Jinja2Templates(directory="templates")
 
 
 # ---------------------------------------------------------------------------
-# Credentials – persisted to credentials.json, seeded from env vars
+# User store  {username: {password, can_upload}}
 # ---------------------------------------------------------------------------
-def _load_credentials() -> dict:
+def _load_users() -> dict[str, dict]:
     if CREDENTIALS_FILE.exists():
         data = json.loads(CREDENTIALS_FILE.read_text())
-        return {"username": data["username"], "password": data["password"]}
+        # Migrate from old single-user format
+        if isinstance(data, dict) and "username" in data:
+            return {data["username"]: {"password": data["password"], "can_upload": True}}
+        return {
+            u["username"]: {"password": u["password"], "can_upload": u.get("can_upload", False)}
+            for u in data
+        }
     return {
-        "username": os.getenv("AUTH_USERNAME", "admin"),
-        "password": os.getenv("AUTH_PASSWORD", "changeme"),
+        os.getenv("AUTH_USERNAME", "admin"): {
+            "password": os.getenv("AUTH_PASSWORD", "changeme"),
+            "can_upload": True,
+        }
     }
 
 
-def _save_credentials(username: str, password: str) -> None:
-    CREDENTIALS_FILE.write_text(json.dumps({"username": username, "password": password}))
+def _save_users() -> None:
+    data = [
+        {"username": uname, "password": u["password"], "can_upload": u["can_upload"]}
+        for uname, u in _users.items()
+    ]
+    CREDENTIALS_FILE.write_text(json.dumps(data, indent=2))
 
 
-_credentials = _load_credentials()
+_users: dict[str, dict] = _load_users()
 
 
 # ---------------------------------------------------------------------------
-# Auth
+# Auth dependencies
 # ---------------------------------------------------------------------------
-def require_auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:
-    correct_username = secrets.compare_digest(credentials.username, _credentials["username"])
-    correct_password = secrets.compare_digest(credentials.password, _credentials["password"])
-    if not (correct_username and correct_password):
+def require_auth(credentials: HTTPBasicCredentials = Depends(security)) -> dict:
+    user = _users.get(credentials.username)
+    if not user or not secrets.compare_digest(credentials.password, user["password"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
             headers={"WWW-Authenticate": "Basic"},
         )
-    return credentials.username
+    return {"username": credentials.username, **user}
+
+
+def require_upload(user: dict = Depends(require_auth)) -> dict:
+    if not user["can_upload"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Upload permission required.")
+    return user
+
+
+def require_admin(user: dict = Depends(require_auth)) -> dict:
+    if not user["can_upload"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+    return user
 
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request, username: str = Depends(require_auth)):
-    return templates.TemplateResponse("index.html", {"request": request, "username": username})
+async def index(request: Request, user: dict = Depends(require_auth)):
+    return templates.TemplateResponse("index.html", {"request": request, "user": user})
 
 
 @app.post("/upload")
 async def upload(
     file: UploadFile = File(...),
-    username: str = Depends(require_auth),
+    user: dict = Depends(require_upload),
 ):
     filename = file.filename or ""
     if not filename.lower().endswith(".csv"):
@@ -94,53 +118,133 @@ async def upload(
 
 
 @app.get("/download")
-async def download(username: str = Depends(require_auth)):
+async def download(user: dict = Depends(require_auth)):
     dest = UPLOAD_DIR / "Persons.csv"
     if not dest.exists():
         raise HTTPException(status_code=404, detail="Persons.csv has not been uploaded yet.")
     return FileResponse(dest, media_type="text/csv", filename="Persons.csv")
 
 
+# ---------------------------------------------------------------------------
+# Admin – user management
+# ---------------------------------------------------------------------------
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_get(request: Request, username: str = Depends(require_auth)):
+async def admin_get(request: Request, user: dict = Depends(require_admin)):
     return templates.TemplateResponse("admin.html", {
         "request": request,
-        "username": username,
-        "current_username": _credentials["username"],
+        "user": user,
+        "users": _users,
         "error": None,
-        "success": False,
+        "success": None,
     })
 
 
-@app.post("/admin", response_class=HTMLResponse)
-async def admin_post(
+@app.post("/admin/users/add", response_class=HTMLResponse)
+async def admin_add_user(
     request: Request,
-    username: str = Depends(require_auth),
+    user: dict = Depends(require_admin),
     new_username: str = Form(...),
     new_password: str = Form(...),
     confirm_password: str = Form(...),
+    can_upload: Optional[str] = Form(default=None),
 ):
-    def render(error=None, success=False):
+    def render(error=None, success=None):
         return templates.TemplateResponse("admin.html", {
             "request": request,
-            "username": username,
-            "current_username": _credentials["username"],
+            "user": user,
+            "users": _users,
             "error": error,
             "success": success,
         })
 
     new_username = new_username.strip()
-
     if not new_username:
         return render(error="Username cannot be blank.")
+    if new_username in _users:
+        return render(error=f"Username '{new_username}' already exists.")
     if len(new_password) < 8:
         return render(error="Password must be at least 8 characters.")
     if new_password != confirm_password:
         return render(error="Passwords do not match.")
 
-    global _credentials
-    _credentials = {"username": new_username, "password": new_password}
-    _save_credentials(new_username, new_password)
+    _users[new_username] = {"password": new_password, "can_upload": can_upload is not None}
+    _save_users()
+    return render(success=f"User '{new_username}' added.")
 
-    # Render success page – browser will re-prompt on next navigation
+
+@app.post("/admin/users/{target_username}/delete")
+async def admin_delete_user(
+    target_username: str,
+    user: dict = Depends(require_admin),
+):
+    if target_username not in _users:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if target_username == user["username"]:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
+    if _users[target_username]["can_upload"]:
+        remaining = sum(1 for u, v in _users.items() if v["can_upload"] and u != target_username)
+        if remaining == 0:
+            raise HTTPException(status_code=400, detail="Cannot delete the last user with upload/admin access.")
+    del _users[target_username]
+    _save_users()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.get("/admin/users/{target_username}/edit", response_class=HTMLResponse)
+async def admin_edit_get(
+    target_username: str,
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    if target_username not in _users:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return templates.TemplateResponse("edit_user.html", {
+        "request": request,
+        "user": user,
+        "target_username": target_username,
+        "target_user": _users[target_username],
+        "error": None,
+        "success": False,
+    })
+
+
+@app.post("/admin/users/{target_username}/edit", response_class=HTMLResponse)
+async def admin_edit_post(
+    target_username: str,
+    request: Request,
+    user: dict = Depends(require_admin),
+    new_password: str = Form(default=""),
+    confirm_password: str = Form(default=""),
+    can_upload: Optional[str] = Form(default=None),
+):
+    if target_username not in _users:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    def render(error=None, success=False):
+        return templates.TemplateResponse("edit_user.html", {
+            "request": request,
+            "user": user,
+            "target_username": target_username,
+            "target_user": _users[target_username],
+            "error": error,
+            "success": success,
+        })
+
+    can_upload_bool = can_upload is not None
+
+    # Guard: don't remove the last admin
+    if not can_upload_bool and _users[target_username]["can_upload"]:
+        remaining = sum(1 for u, v in _users.items() if v["can_upload"] and u != target_username)
+        if remaining == 0:
+            return render(error="Cannot remove upload access from the last admin user.")
+
+    if new_password:
+        if len(new_password) < 8:
+            return render(error="Password must be at least 8 characters.")
+        if new_password != confirm_password:
+            return render(error="Passwords do not match.")
+        _users[target_username]["password"] = new_password
+
+    _users[target_username]["can_upload"] = can_upload_bool
+    _save_users()
     return render(success=True)
