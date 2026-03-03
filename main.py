@@ -179,15 +179,15 @@ async def admin_delete_user(
 ):
     if target_username not in _users:
         raise HTTPException(status_code=404, detail="User not found.")
-    if target_username == user["username"]:
-        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
     if _users[target_username]["can_upload"]:
         remaining = sum(1 for u, v in _users.items() if v["can_upload"] and u != target_username)
         if remaining == 0:
-            raise HTTPException(status_code=400, detail="Cannot delete the last user with upload/admin access.")
+            raise HTTPException(status_code=400, detail="Cannot delete the last user with upload access.")
     del _users[target_username]
     _save_users()
-    return RedirectResponse("/admin", status_code=303)
+    # If the user deleted their own account, send them to / which will trigger a re-auth prompt
+    redirect_to = "/" if target_username == user["username"] else "/admin"
+    return RedirectResponse(redirect_to, status_code=303)
 
 
 @app.get("/admin/users/{target_username}/edit", response_class=HTMLResponse)

@@ -73,14 +73,12 @@
               <div class="inline-flex items-center gap-3">
                 <a href="/admin/users/{{ uname }}/edit"
                    class="text-indigo-500 hover:text-indigo-700 font-medium transition-colors">Edit</a>
-                {% if uname != user.username %}
                 <form method="post" action="/admin/users/{{ uname }}/delete"
-                      onsubmit="return confirm('Delete user \'{{ uname }}\'?')">
+                      onsubmit="return confirm('{% if uname == user.username %}Delete your own account? You will be signed out.{% else %}Delete user \'{{ uname }}\'?{% endif %}')">
                   <button type="submit" class="text-red-400 hover:text-red-600 font-medium transition-colors">
                     Delete
                   </button>
                 </form>
-                {% endif %}
               </div>
             </td>
           </tr>
