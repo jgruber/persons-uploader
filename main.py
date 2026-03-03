@@ -124,7 +124,16 @@ async def download(user: dict = Depends(require_auth)):
     dest = UPLOAD_DIR / "Persons.csv"
     if not dest.exists():
         raise HTTPException(status_code=404, detail="Persons.csv has not been uploaded yet.")
-    return FileResponse(dest, media_type="text/csv", filename="Persons.csv")
+    return FileResponse(
+        dest,
+        media_type="text/csv",
+        filename="Persons.csv",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
