@@ -4,7 +4,7 @@ import secrets
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -94,9 +94,16 @@ def require_admin(user: dict = Depends(require_auth)) -> dict:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+def _file_state() -> dict:
+    return {
+        "persons_exists": (UPLOAD_DIR / "Persons.csv").exists(),
+        "tag_files": sorted(f.name for f in UPLOAD_DIR.glob("*.json")),
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, user: dict = Depends(require_auth)):
-    return templates.TemplateResponse("index.html", {"request": request, "user": user})
+    return templates.TemplateResponse("index.html", {"request": request, "user": user, **_file_state()})
 
 
 @app.post("/upload")
@@ -119,8 +126,73 @@ async def upload(
     return JSONResponse({"message": f"Persons.csv saved successfully ({len(contents):,} bytes)."})
 
 
+@app.post("/upload/tags")
+async def upload_tags(
+    files: list[UploadFile] = File(...),
+    user: dict = Depends(require_upload),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided.")
+
+    saved = []
+    for file in files:
+        filename = Path(file.filename or "").name
+        if not filename.lower().endswith(".json"):
+            raise HTTPException(status_code=400, detail=f"Only JSON files are accepted (got: {filename}).")
+        contents = await file.read()
+        try:
+            json.loads(contents)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail=f"{filename} is not valid JSON.")
+        (UPLOAD_DIR / filename).write_bytes(contents)
+        saved.append(filename)
+
+    return JSONResponse({"message": f"{len(saved)} tag file(s) saved.", "files": saved})
+
+
+@app.delete("/upload/persons")
+async def delete_persons(user: dict = Depends(require_upload)):
+    dest = UPLOAD_DIR / "Persons.csv"
+    if not dest.exists():
+        raise HTTPException(status_code=404, detail="Persons.csv not found.")
+    dest.unlink()
+    return JSONResponse({"message": "Persons.csv deleted."})
+
+
+@app.delete("/upload/tags/{filename}")
+async def delete_tag(filename: str, user: dict = Depends(require_upload)):
+    safe_name = Path(filename).name
+    if not safe_name.lower().endswith(".json"):
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+    dest = UPLOAD_DIR / safe_name
+    if not dest.exists():
+        raise HTTPException(status_code=404, detail=f"{safe_name} not found.")
+    dest.unlink()
+    return JSONResponse({"message": f"{safe_name} deleted."})
+
+
+_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
 @app.get("/download")
-async def download(user: dict = Depends(require_auth)):
+async def download(
+    user: dict = Depends(require_auth),
+    tags: Optional[str] = Query(default=None),
+):
+    if tags is not None:
+        tag_files = sorted(UPLOAD_DIR.glob("*.json"))
+        if not tag_files:
+            raise HTTPException(status_code=404, detail="No tag files found.")
+        combined = [json.loads(f.read_text()) for f in tag_files]
+        return JSONResponse(
+            combined,
+            headers={**_NO_CACHE_HEADERS, "Content-Disposition": 'attachment; filename="tags.json"'},
+        )
+
     dest = UPLOAD_DIR / "Persons.csv"
     if not dest.exists():
         raise HTTPException(status_code=404, detail="Persons.csv has not been uploaded yet.")
@@ -128,11 +200,7 @@ async def download(user: dict = Depends(require_auth)):
         dest,
         media_type="text/csv",
         filename="Persons.csv",
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        },
+        headers=_NO_CACHE_HEADERS,
     )
 
 

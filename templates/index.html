@@ -98,6 +98,101 @@
     <!-- Result banner -->
     <div id="resultBanner" class="hidden mt-5 rounded-xl px-4 py-3 text-sm font-medium"></div>
 
+    <!-- Persons.csv current status -->
+    <div id="personsStatus" class="mt-4">
+      {% if persons_exists %}
+      <div id="personsExistsBar" class="flex items-center justify-between bg-green-50 border border-green-200 rounded-lg px-4 py-2.5">
+        <div class="flex items-center gap-2 text-sm font-medium text-green-700">
+          <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"/>
+          </svg>
+          Persons.csv is uploaded
+        </div>
+        {% if user.can_upload %}
+        <button id="deletePersonsBtn" class="text-xs font-medium text-red-400 hover:text-red-600 transition-colors">Delete</button>
+        {% endif %}
+      </div>
+      {% else %}
+      <div id="personsExistsBar" class="hidden flex items-center justify-between bg-green-50 border border-green-200 rounded-lg px-4 py-2.5">
+        <div class="flex items-center gap-2 text-sm font-medium text-green-700">
+          <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"/>
+          </svg>
+          Persons.csv is uploaded
+        </div>
+        {% if user.can_upload %}
+        <button id="deletePersonsBtn" class="text-xs font-medium text-red-400 hover:text-red-600 transition-colors">Delete</button>
+        {% endif %}
+      </div>
+      {% endif %}
+    </div>
+
+    {% if user.can_upload %}
+    <!-- Tag files upload -->
+    <div class="mt-8 pt-8 border-t border-gray-100">
+      <h2 class="text-base font-semibold text-gray-700 mb-4">Tag Files <span class="text-xs font-normal text-gray-400">.json</span></h2>
+
+      <div id="tagDropZone"
+           class="relative border-2 border-dashed border-gray-300 rounded-xl p-8 text-center cursor-pointer transition-colors duration-200 hover:border-indigo-400 hover:bg-indigo-50">
+        <input id="tagFileInput" type="file" accept=".json" multiple
+               class="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+        <svg class="mx-auto mb-2 w-8 h-8 text-gray-400" xmlns="http://www.w3.org/2000/svg" fill="none"
+             viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round"
+                d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m6.75 12-3-3m0 0-3 3m3-3v6m-1.5-15H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
+        </svg>
+        <p class="text-gray-600 font-medium text-sm">Drag &amp; drop JSON tag files here</p>
+        <p class="text-gray-400 text-xs mt-1">or <span class="text-indigo-500 underline">browse</span> &mdash; multiple files supported</p>
+      </div>
+
+      <!-- Selected tag files list -->
+      <ul id="tagFileList" class="hidden mt-3 space-y-1.5"></ul>
+
+      <button id="tagUploadBtn"
+              class="mt-4 w-full py-2.5 px-4 rounded-xl font-semibold text-sm text-white bg-indigo-600
+                     hover:bg-indigo-700 active:scale-95 transition disabled:opacity-40 disabled:cursor-not-allowed disabled:active:scale-100"
+              disabled>
+        Upload Tag Files
+      </button>
+
+      <!-- Tag progress bar -->
+      <div id="tagProgressWrapper" class="hidden mt-3">
+        <div class="flex justify-between text-xs text-gray-500 mb-1">
+          <span>Uploading…</span>
+          <span id="tagProgressPct">0%</span>
+        </div>
+        <div class="w-full bg-gray-200 rounded-full h-2">
+          <div id="tagProgressBar" class="bg-indigo-500 h-2 rounded-full transition-all duration-100" style="width:0%"></div>
+        </div>
+      </div>
+
+      <div id="tagResultBanner" class="hidden mt-4 rounded-xl px-4 py-3 text-sm font-medium"></div>
+
+      <!-- Server tag file list -->
+      <div id="serverTagSection" class="mt-5">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="text-sm font-medium text-gray-600">Uploaded tag files</h3>
+          <button id="deleteSelectedTagsBtn"
+                  class="text-xs font-medium text-red-400 hover:text-red-600 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  disabled>Delete Selected</button>
+        </div>
+        <ul id="serverTagList" class="space-y-1.5">
+          {% for filename in tag_files %}
+          <li class="flex items-center gap-3 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2" data-filename="{{ filename }}">
+            <input type="checkbox" class="tagCheckbox w-4 h-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
+            <span class="text-sm text-gray-700 font-medium truncate flex-1">{{ filename }}</span>
+          </li>
+          {% endfor %}
+        </ul>
+        {% if not tag_files %}
+        <p id="noTagFilesMsg" class="text-xs text-gray-400 text-center py-2">No tag files uploaded yet.</p>
+        {% else %}
+        <p id="noTagFilesMsg" class="hidden text-xs text-gray-400 text-center py-2">No tag files uploaded yet.</p>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+
     {% else %}
     <!-- Viewer notice -->
     <div class="rounded-xl bg-gray-50 border border-gray-200 px-5 py-6 text-center text-sm text-gray-500">
@@ -107,15 +202,26 @@
 
     <!-- Footer links -->
     <div class="mt-6 pt-6 border-t border-gray-100 flex items-center justify-between">
-      <a href="/download"
-         class="inline-flex items-center gap-2 text-sm font-medium text-indigo-600 hover:text-indigo-800 transition-colors">
-        <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none"
-             viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-          <path stroke-linecap="round" stroke-linejoin="round"
-                d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
-        </svg>
-        Download current Persons.csv
-      </a>
+      <div class="flex items-center gap-4">
+        <a href="/download"
+           class="inline-flex items-center gap-2 text-sm font-medium text-indigo-600 hover:text-indigo-800 transition-colors">
+          <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none"
+               viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round"
+                  d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
+          </svg>
+          Download Persons.csv
+        </a>
+        <a href="/download?tags"
+           class="inline-flex items-center gap-2 text-sm font-medium text-indigo-600 hover:text-indigo-800 transition-colors">
+          <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" fill="none"
+               viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round"
+                  d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
+          </svg>
+          Download tags.json
+        </a>
+      </div>
 
       {% if user.can_upload %}
       <a href="/admin"
@@ -237,6 +343,7 @@
           const data = JSON.parse(xhr.responseText);
           showBanner('✓ ' + data.message, true);
           clearSelection();
+          personsExistsBar.classList.remove('hidden');
         } else {
           let detail = 'Upload failed.';
           try { detail = JSON.parse(xhr.responseText).detail || detail; } catch (_) {}
@@ -254,6 +361,189 @@
       xhr.open('POST', '/upload');
       xhr.send(formData);
     });
+
+    // -----------------------------------------------------------------------
+    // Tag file upload
+    // -----------------------------------------------------------------------
+    const tagDropZone       = document.getElementById('tagDropZone');
+    const tagFileInput      = document.getElementById('tagFileInput');
+    const tagFileList       = document.getElementById('tagFileList');
+    const tagUploadBtn      = document.getElementById('tagUploadBtn');
+    const tagProgressWrapper = document.getElementById('tagProgressWrapper');
+    const tagProgressBar    = document.getElementById('tagProgressBar');
+    const tagProgressPct    = document.getElementById('tagProgressPct');
+    const tagResultBanner   = document.getElementById('tagResultBanner');
+
+    let tagFiles = [];
+
+    function renderTagFileList() {
+      tagFileList.innerHTML = '';
+      tagFiles.forEach((file, idx) => {
+        const li = document.createElement('li');
+        li.className = 'flex items-center justify-between bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 text-sm';
+        li.innerHTML = `
+          <span class="truncate text-gray-700 font-medium">${file.name}</span>
+          <span class="ml-3 text-xs text-gray-400 flex-shrink-0">${formatBytes(file.size)}</span>
+          <button data-idx="${idx}" class="ml-3 text-gray-400 hover:text-red-500 transition-colors flex-shrink-0 removeTag">
+            <svg class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12"/>
+            </svg>
+          </button>`;
+        tagFileList.appendChild(li);
+      });
+      tagFileList.classList.toggle('hidden', tagFiles.length === 0);
+      tagUploadBtn.disabled = tagFiles.length === 0;
+    }
+
+    function addTagFiles(incoming) {
+      const valid = Array.from(incoming).filter(f => f.name.toLowerCase().endsWith('.json'));
+      const invalid = Array.from(incoming).filter(f => !f.name.toLowerCase().endsWith('.json'));
+      if (invalid.length) showTagBanner(`Skipped ${invalid.length} non-JSON file(s).`, false);
+      valid.forEach(f => { if (!tagFiles.find(e => e.name === f.name)) tagFiles.push(f); });
+      renderTagFileList();
+    }
+
+    function showTagBanner(message, success) {
+      tagResultBanner.textContent = message;
+      tagResultBanner.className = 'mt-4 rounded-xl px-4 py-3 text-sm font-medium ' +
+        (success ? 'bg-green-50 text-green-700 border border-green-200'
+                 : 'bg-red-50 text-red-700 border border-red-200');
+      tagResultBanner.classList.remove('hidden');
+    }
+
+    tagFileInput.addEventListener('change', () => { if (tagFileInput.files.length) addTagFiles(tagFileInput.files); });
+
+    tagFileList.addEventListener('click', (e) => {
+      const btn = e.target.closest('.removeTag');
+      if (!btn) return;
+      tagFiles.splice(parseInt(btn.dataset.idx), 1);
+      renderTagFileList();
+    });
+
+    ['dragenter', 'dragover'].forEach(evt =>
+      tagDropZone.addEventListener(evt, (e) => { e.preventDefault(); tagDropZone.classList.add('drop-active'); })
+    );
+    ['dragleave', 'drop'].forEach(evt =>
+      tagDropZone.addEventListener(evt, (e) => { e.preventDefault(); tagDropZone.classList.remove('drop-active'); })
+    );
+    tagDropZone.addEventListener('drop', (e) => { if (e.dataTransfer.files.length) addTagFiles(e.dataTransfer.files); });
+
+    tagUploadBtn.addEventListener('click', () => {
+      if (!tagFiles.length) return;
+      const formData = new FormData();
+      tagFiles.forEach(f => formData.append('files', f));
+      const xhr = new XMLHttpRequest();
+
+      tagProgressWrapper.classList.remove('hidden');
+      tagUploadBtn.disabled = true;
+      tagResultBanner.classList.add('hidden');
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+          const pct = Math.round((e.loaded / e.total) * 100);
+          tagProgressBar.style.width = pct + '%';
+          tagProgressPct.textContent = pct + '%';
+        }
+      });
+
+      xhr.addEventListener('load', () => {
+        tagProgressWrapper.classList.add('hidden');
+        tagProgressBar.style.width = '0%';
+        if (xhr.status === 200) {
+          const data = JSON.parse(xhr.responseText);
+          showTagBanner('✓ ' + data.message, true);
+          tagFiles = [];
+          tagFileInput.value = '';
+          renderTagFileList();
+          window._addToServerTagList(data.files);
+        } else {
+          let detail = 'Upload failed.';
+          try { detail = JSON.parse(xhr.responseText).detail || detail; } catch (_) {}
+          showTagBanner('✗ ' + detail, false);
+          tagUploadBtn.disabled = false;
+        }
+      });
+
+      xhr.addEventListener('error', () => {
+        tagProgressWrapper.classList.add('hidden');
+        showTagBanner('✗ Network error. Please try again.', false);
+        tagUploadBtn.disabled = false;
+      });
+
+      xhr.open('POST', '/upload/tags');
+      xhr.send(formData);
+    });
+
+    // After a successful tag upload, add new files to the server list
+    function addToServerTagList(filenames) {
+      const list = document.getElementById('serverTagList');
+      const noMsg = document.getElementById('noTagFilesMsg');
+      filenames.forEach(filename => {
+        if (list.querySelector(`[data-filename="${filename}"]`)) return; // already exists
+        const li = document.createElement('li');
+        li.className = 'flex items-center gap-3 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2';
+        li.dataset.filename = filename;
+        li.innerHTML = `
+          <input type="checkbox" class="tagCheckbox w-4 h-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
+          <span class="text-sm text-gray-700 font-medium truncate flex-1">${filename}</span>`;
+        list.appendChild(li);
+      });
+      noMsg.classList.add('hidden');
+      syncTagCheckboxes();
+    }
+
+    // -----------------------------------------------------------------------
+    // Delete – Persons.csv
+    // -----------------------------------------------------------------------
+    const deletePersonsBtn = document.getElementById('deletePersonsBtn');
+    const personsExistsBar = document.getElementById('personsExistsBar');
+
+    if (deletePersonsBtn) {
+      deletePersonsBtn.addEventListener('click', async () => {
+        if (!confirm('Delete Persons.csv from the server?')) return;
+        const res = await fetch('/upload/persons', { method: 'DELETE' });
+        if (res.ok) {
+          personsExistsBar.classList.add('hidden');
+          showBanner('Persons.csv deleted.', true);
+        } else {
+          const data = await res.json().catch(() => ({}));
+          showBanner('✗ ' + (data.detail || 'Delete failed.'), false);
+        }
+      });
+    }
+
+    // -----------------------------------------------------------------------
+    // Delete – tag files
+    // -----------------------------------------------------------------------
+    const serverTagList         = document.getElementById('serverTagList');
+    const deleteSelectedTagsBtn = document.getElementById('deleteSelectedTagsBtn');
+    const noTagFilesMsg         = document.getElementById('noTagFilesMsg');
+
+    function syncTagCheckboxes() {
+      const checked = serverTagList.querySelectorAll('.tagCheckbox:checked');
+      deleteSelectedTagsBtn.disabled = checked.length === 0;
+    }
+
+    serverTagList.addEventListener('change', syncTagCheckboxes);
+
+    deleteSelectedTagsBtn.addEventListener('click', async () => {
+      const checked = [...serverTagList.querySelectorAll('.tagCheckbox:checked')];
+      if (!checked.length) return;
+      const names = checked.map(cb => cb.closest('li').dataset.filename);
+      if (!confirm(`Delete ${names.length} tag file(s)?`)) return;
+
+      for (const name of names) {
+        const res = await fetch(`/upload/tags/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        if (res.ok) {
+          serverTagList.querySelector(`[data-filename="${name}"]`).remove();
+        }
+      }
+      if (serverTagList.children.length === 0) noTagFilesMsg.classList.remove('hidden');
+      deleteSelectedTagsBtn.disabled = true;
+    });
+
+    // Expose addToServerTagList for the tag upload handler to call
+    window._addToServerTagList = addToServerTagList;
   </script>
   {% endif %}
 </body>
