@@ -2,6 +2,8 @@
 
 A web-based file management service for uploading and sharing `Persons.csv` and JSON tag files, with multi-user support and role-based access control.
 
+> This service is designed to work alongside the [Congregation Directory](https://github.com/jgruber/congregation-directory) application, which consumes the files managed here.
+
 ## Features
 
 - Upload and manage a `Persons.csv` file
