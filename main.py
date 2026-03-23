@@ -29,7 +29,7 @@ CREDENTIALS_FILE = Path("credentials.json")
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-templates = Jinja2Templates(directory="templates")
+templates = Jinja2Templates(directory="templates", cache_size=0)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
