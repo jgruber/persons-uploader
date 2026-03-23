@@ -109,7 +109,7 @@ def _file_state() -> dict:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, user: dict = Depends(require_auth)):
-    return templates.TemplateResponse("index.html", {"request": request, "user": user, **_file_state()})
+    return templates.TemplateResponse(request, "index.html", {"user": user, **_file_state()})
 
 
 @app.post("/upload")
@@ -215,8 +215,7 @@ async def download(
 # ---------------------------------------------------------------------------
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_get(request: Request, user: dict = Depends(require_admin)):
-    return templates.TemplateResponse("admin.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "admin.html", {
         "user": user,
         "users": _users,
         "error": None,
@@ -234,8 +233,7 @@ async def admin_add_user(
     can_upload: Optional[str] = Form(default=None),
 ):
     def render(error=None, success=None):
-        return templates.TemplateResponse("admin.html", {
-            "request": request,
+        return templates.TemplateResponse(request, "admin.html", {
             "user": user,
             "users": _users,
             "error": error,
@@ -283,8 +281,7 @@ async def admin_edit_get(
 ):
     if target_username not in _users:
         raise HTTPException(status_code=404, detail="User not found.")
-    return templates.TemplateResponse("edit_user.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "edit_user.html", {
         "user": user,
         "target_username": target_username,
         "target_user": _users[target_username],
@@ -306,8 +303,7 @@ async def admin_edit_post(
         raise HTTPException(status_code=404, detail="User not found.")
 
     def render(error=None, success=False):
-        return templates.TemplateResponse("edit_user.html", {
-            "request": request,
+        return templates.TemplateResponse(request, "edit_user.html", {
             "user": user,
             "target_username": target_username,
             "target_user": _users[target_username],
