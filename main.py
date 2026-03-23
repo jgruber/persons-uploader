@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from jinja2 import Environment, FileSystemLoader
 
 app = FastAPI(title="Persons Uploader")
 security = HTTPBasic()
@@ -29,7 +30,12 @@ CREDENTIALS_FILE = Path("credentials.json")
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-templates = Jinja2Templates(directory="templates", cache_size=0)
+_jinja_env = Environment(
+    loader=FileSystemLoader("templates"),
+    autoescape=True,
+    cache_size=0,  # avoids Jinja2 >=3.1.4 bug where globals dict ends up in LRU cache key
+)
+templates = Jinja2Templates(env=_jinja_env)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
