@@ -18,7 +18,7 @@ security = HTTPBasic()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["*"],
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
 )
 
