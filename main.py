@@ -647,17 +647,83 @@ _mcp_db_lock = threading.Lock()
 _log = logging.getLogger("uvicorn.error")
 
 
+def _tag_files() -> list[Path]:
+    return sorted(UPLOAD_DIR.glob("*.json"))
+
+
+def _flatten_tag_data(node) -> list[dict]:
+    """A tag file holds one tag object, or (bundled exports) a possibly nested list of them."""
+    if isinstance(node, list):
+        return [t for item in node for t in _flatten_tag_data(item)]
+    return [node] if isinstance(node, dict) else []
+
+
+def _add_custom_tags(db_path: str) -> None:
+    """Add the uploaded tag files to the tags table as type 'custom'.
+
+    Mirrors the congregation-directory app: an assignment matches a person by id first,
+    then by display name; assignments matching no one in the current CSV are skipped.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        persons = conn.execute("SELECT id, display_name FROM persons").fetchall()
+        valid_ids = {pid for pid, _ in persons}
+        name_to_id = {(dn or "").strip().lower(): pid for pid, dn in persons if dn}
+        rows: set[tuple] = set()
+        for path in _tag_files():
+            try:
+                tags = _flatten_tag_data(json.loads(path.read_text(encoding="utf-8-sig")))
+            except (OSError, ValueError) as e:
+                _log.warning("Skipping tag file %s: %s", path.name, e)
+                continue
+            for tag in tags:
+                name = tag.get("tagName")
+                if tag.get("version") != 1 or not isinstance(name, str) or not name.strip() \
+                        or not isinstance(tag.get("assignments"), list):
+                    _log.warning("Skipping invalid tag in %s", path.name)
+                    continue
+                for a in tag["assignments"]:
+                    if not isinstance(a, dict):
+                        continue
+                    pid = a.get("personId")
+                    if pid not in valid_ids:
+                        pid = name_to_id.get(str(a.get("name") or "").strip().lower())
+                    if pid is not None:
+                        rows.add((pid, "custom", name.strip(), ""))
+        conn.executemany("INSERT INTO tags VALUES (?,?,?,?)", sorted(rows))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _mcp_sources_signature() -> str:
+    """Changes whenever Persons.csv or any tag file is replaced, added or deleted."""
+    parts = []
+    for path in [UPLOAD_DIR / "Persons.csv", *_tag_files()]:
+        try:
+            st = path.stat()
+        except FileNotFoundError:  # deleted since the listing
+            continue
+        parts.append(f"{path.name}:{st.st_mtime_ns}:{st.st_size}")
+    return "|".join(parts)
+
+
 def _mcp_db() -> sqlite3.Connection:
-    """Read-only connection to the cached DB, rebuilt when Persons.csv is newer."""
+    """Read-only connection to the cached DB, rebuilt when Persons.csv or a tag file changes."""
     csv_path = UPLOAD_DIR / "Persons.csv"
     if not csv_path.exists():
         raise ToolError("No Persons.csv has been uploaded yet.")
     with _mcp_db_lock:
-        if not MCP_DB_PATH.exists() or MCP_DB_PATH.stat().st_mtime < csv_path.stat().st_mtime:
+        signature = _mcp_sources_signature()
+        sig_path = MCP_DB_PATH.with_suffix(".sig")
+        current = sig_path.read_text() if sig_path.exists() else None
+        if not MCP_DB_PATH.exists() or current != signature:
             tmp_path = _csv_to_sqlite(csv_path)
+            _add_custom_tags(tmp_path)
             staged = MCP_DB_PATH.with_suffix(".tmp")
             shutil.move(tmp_path, staged)
             os.replace(staged, MCP_DB_PATH)
+            sig_path.write_text(signature)
     conn = sqlite3.connect(f"file:{MCP_DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
@@ -734,7 +800,8 @@ _mcp = MCPServer(
         "or get_family for details. search_families answers family-level questions (e.g. families with "
         "an elder, and how many people are in them) in one call instead of one get_family per family. "
         "People who have moved away or been removed are left out unless include_moved "
-        "is true. Phone, email and address appear only when this API key has that scope."
+        "is true. Tags include custom tags uploaded by the congregation (marked custom in list_tags). "
+        "Phone, email and address appear only when this API key has that scope."
     ),
 )
 
@@ -952,19 +1019,24 @@ def list_field_service_groups() -> dict:
 
 @_mcp.tool(annotations=_READ_ONLY)
 def list_tags() -> dict:
-    """List the tag names usable with search_persons, with how many current members have each."""
+    """List the tag names usable with search_persons and search_families, with how many current
+    members have each. Tags marked custom come from tag files uploaded by the congregation
+    (e.g. "English Elders") rather than from Persons.csv."""
     _log_call("list_tags")
     hidden = _HIDDEN_TAGS | _REDUNDANT_TAGS
     with closing(_mcp_db()) as conn:
         rows = conn.execute(
-            f"""SELECT t.name, COUNT(DISTINCT t.person_id) AS people
+            f"""SELECT t.name, MAX(t.type = 'custom') AS custom, COUNT(DISTINCT t.person_id) AS people
                   FROM tags t JOIN persons p ON p.id = t.person_id
                  WHERE p.moved = 0 AND p.removed = 0
                    AND t.name NOT IN ({','.join('?' * len(hidden))})
                  GROUP BY t.name ORDER BY t.name""",
             sorted(hidden),
         ).fetchall()
-    return {"tags": [{"tag": r["name"], "people": r["people"]} for r in rows]}
+    return {"tags": [
+        {"tag": r["name"], "people": r["people"], **({"custom": True} if r["custom"] else {})}
+        for r in rows
+    ]}
 
 
 class _MCPKeyAuth:

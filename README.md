@@ -100,8 +100,13 @@ Every key sees names, families, field service groups and tags. Scopes add more:
 | `contact` | Phone and email (`get_person`) |
 | `address` | Street address, city and ZIP (`get_person`, `get_family`) |
 
+Uploaded tag files (`tag_*.json`) are included as custom tags: they appear in `list_tags` marked
+`custom`, work with `search_persons(tag=...)` and `search_families(member_tag=...)`, and show in each
+person's tags. Assignments match by person id, then by display name, as in congregation-directory;
+`/download/database` is unchanged and still contains only the CSV-derived tags.
+
 Birth dates, coordinates and the Incarcerated tag are never exposed. The directory DB is rebuilt
-from `Persons.csv` on the first call after each upload. Each tool call is logged with its key to
+from `Persons.csv` and the tag files on the first call after any of them is uploaded or deleted. Each tool call is logged with its key to
 `$MCP_STATE_DIR/calls.log` and the container log.
 
 ## Project Structure
