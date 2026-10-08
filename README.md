@@ -11,6 +11,7 @@ A web-based file management service for uploading and sharing `Persons.csv` and 
 - Download files (with no-cache headers for always-fresh data)
 - Role-based access: **Uploaders** (full access) and **Viewers** (download only)
 - User management admin panel
+- Read-only MCP endpoint (`/mcp`) so remote agents can search the directory, with API keys managed in the admin panel
 - Drag-and-drop upload UI with progress tracking
 
 ## Roles
@@ -34,6 +35,7 @@ AUTH_PASSWORD=changeme
 | `AUTH_USERNAME` | `admin` | Initial admin username |
 | `AUTH_PASSWORD` | `changeme` | Initial admin password |
 | `UPLOAD_DIR` | `./uploads` | Directory for stored files |
+| `MCP_STATE_DIR` | `$UPLOAD_DIR/.mcp` | API keys, cached directory DB and MCP call log |
 
 > **Note:** Change the default password before exposing the service publicly.
 
@@ -74,6 +76,31 @@ uvicorn main:app --reload
 | `POST` | `/admin/users/add` | Uploader | Create user |
 | `POST` | `/admin/users/{username}/delete` | Uploader | Delete user |
 | `GET/POST` | `/admin/users/{username}/edit` | Uploader | Edit user |
+| `GET` | `/download/database` | Any | Download the directory as SQLite |
+| `POST` | `/admin/keys/add` | Uploader | Create an API key (shown once) |
+| `POST` | `/admin/keys/{id}/rotate` | Uploader | Replace a key, keeping its name and scopes |
+| `POST` | `/admin/keys/{id}/revoke` | Uploader | Revoke a key |
+| `POST` | `/mcp` | API key | MCP endpoint (streamable HTTP) |
+
+## MCP Endpoint
+
+`/mcp` serves a read-only MCP server over streamable HTTP (stateless, JSON responses). Every request
+needs `Authorization: Bearer <api key>`; create keys under **API Keys** on the admin page. Only a
+SHA-256 hash of each key is stored, so the key is shown once — rotate it if it is lost.
+
+Tools: `search_persons`, `get_person`, `get_family`, `list_field_service_groups`, `list_tags`.
+People who have moved or been removed are left out unless `include_moved` is set.
+
+Every key sees names, families, field service groups and tags. Scopes add more:
+
+| Scope | Adds |
+|-------|------|
+| `contact` | Phone and email (`get_person`) |
+| `address` | Street address, city and ZIP (`get_person`, `get_family`) |
+
+Birth dates, coordinates and the Incarcerated tag are never exposed. The directory DB is rebuilt
+from `Persons.csv` on the first call after each upload. Each tool call is logged with its key to
+`$MCP_STATE_DIR/calls.log` and the container log.
 
 ## Project Structure
 

@@ -1,24 +1,44 @@
+import contextlib
 import csv
+import hashlib
 import io
 import json
+import logging
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import tempfile
+import threading
+from contextlib import closing
+from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from starlette.background import BackgroundTask
+from starlette.routing import Route
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import Environment, FileSystemLoader
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types import ToolAnnotations
 
-app = FastAPI(title="Persons Uploader")
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # The MCP session manager (defined further down) needs its task group running
+    async with _mcp.session_manager.run():
+        yield
+
+
+app = FastAPI(title="Persons Uploader", lifespan=_lifespan)
 security = HTTPBasic()
 
 app.add_middleware(
@@ -35,6 +55,14 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 CREDENTIALS_FILE = Path("credentials.json")
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# API keys, the cached directory DB and the MCP call log live on the uploads volume,
+# in a subdirectory so the *.json tag-file listing never sees them.
+MCP_STATE_DIR = Path(os.getenv("MCP_STATE_DIR", str(UPLOAD_DIR / ".mcp")))
+MCP_STATE_DIR.mkdir(parents=True, exist_ok=True)
+API_KEYS_FILE = MCP_STATE_DIR / "api_keys.json"
+MCP_DB_PATH = MCP_STATE_DIR / "persons.db"
+MCP_CALL_LOG = MCP_STATE_DIR / "calls.log"
 
 _jinja_env = Environment(
     loader=FileSystemLoader("templates"),
@@ -543,6 +571,344 @@ def _csv_to_sqlite(csv_path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# API keys  [{id, name, prefix, hash, scopes, created, expires, last_used, calls}]
+# Only a SHA-256 of each key is stored; the key itself is shown once at creation.
+# ---------------------------------------------------------------------------
+API_KEY_SCOPES = {
+    "contact": "Phone and email",
+    "address": "Street address, city and ZIP",
+}
+
+
+def _hash_key(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _load_api_keys() -> dict[str, dict]:
+    if API_KEYS_FILE.exists():
+        return {k["id"]: k for k in json.loads(API_KEYS_FILE.read_text())}
+    return {}
+
+
+def _save_api_keys() -> None:
+    tmp = API_KEYS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(list(_api_keys.values()), indent=2))
+    os.replace(tmp, API_KEYS_FILE)
+
+
+def _create_api_key(name: str, scopes: list[str], expires: Optional[str]) -> str:
+    key = "pu_" + secrets.token_urlsafe(32)
+    key_id = secrets.token_hex(4)
+    _api_keys[key_id] = {
+        "id": key_id,
+        "name": name,
+        "prefix": key[:10],
+        "hash": _hash_key(key),
+        "scopes": [s for s in scopes if s in API_KEY_SCOPES],
+        "created": _now(),
+        "expires": expires or None,
+        "last_used": None,
+        "calls": 0,
+    }
+    _save_api_keys()
+    return key
+
+
+def _check_api_key(key: str) -> Optional[dict]:
+    if not key:
+        return None
+    digest = _hash_key(key)
+    for k in _api_keys.values():
+        if secrets.compare_digest(k["hash"], digest):
+            # A key is valid through the end of its expiry date (UTC)
+            if k["expires"] and datetime.now(timezone.utc).date().isoformat() > k["expires"]:
+                return None
+            return k
+    return None
+
+
+_api_keys: dict[str, dict] = _load_api_keys()
+
+
+# ---------------------------------------------------------------------------
+# MCP endpoint – read-only directory search for remote agents
+# ---------------------------------------------------------------------------
+# Never exposed, whatever the key's scopes
+_HIDDEN_TAGS = {"Incarcerated"}
+# Tags that only repeat a field already in the summary
+_REDUNDANT_TAGS = {"Family", "Field Service Group"}
+
+_mcp_caller: ContextVar[Optional[dict]] = ContextVar("_mcp_caller", default=None)
+_mcp_db_lock = threading.Lock()
+_log = logging.getLogger("uvicorn.error")
+
+
+def _mcp_db() -> sqlite3.Connection:
+    """Read-only connection to the cached DB, rebuilt when Persons.csv is newer."""
+    csv_path = UPLOAD_DIR / "Persons.csv"
+    if not csv_path.exists():
+        raise ToolError("No Persons.csv has been uploaded yet.")
+    with _mcp_db_lock:
+        if not MCP_DB_PATH.exists() or MCP_DB_PATH.stat().st_mtime < csv_path.stat().st_mtime:
+            tmp_path = _csv_to_sqlite(csv_path)
+            staged = MCP_DB_PATH.with_suffix(".tmp")
+            shutil.move(tmp_path, staged)
+            os.replace(staged, MCP_DB_PATH)
+    conn = sqlite3.connect(f"file:{MCP_DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _mcp_scopes() -> set[str]:
+    key = _mcp_caller.get()
+    return set(key["scopes"]) if key else set()
+
+
+def _log_call(tool: str, **args) -> None:
+    key = _mcp_caller.get()
+    if key is not None:
+        key["calls"] = key.get("calls", 0) + 1
+        key["last_used"] = _now()
+        _save_api_keys()
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "key_id": key["id"] if key else None,
+        "key_name": key["name"] if key else None,
+        "tool": tool,
+        "args": args,
+    }
+    with MCP_CALL_LOG.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+    _log.info("MCP %s by %s %s", tool, entry["key_name"], json.dumps(args))
+
+
+def _tags_for(conn: sqlite3.Connection, ids: list[int]) -> dict[int, list[str]]:
+    out: dict[int, list[str]] = {}
+    if not ids:
+        return out
+    rows = conn.execute(
+        f"SELECT person_id, name, value FROM tags WHERE person_id IN ({','.join('?' * len(ids))})", ids
+    )
+    for r in rows:
+        if r["name"] in _HIDDEN_TAGS or r["name"] in _REDUNDANT_TAGS:
+            continue
+        label = f"{r['name']}: {r['value']}" if r["value"] else r["name"]
+        tags = out.setdefault(r["person_id"], [])
+        if label not in tags:
+            tags.append(label)
+    return out
+
+
+def _person_summaries(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[dict]:
+    tags = _tags_for(conn, [r["id"] for r in rows])
+    out = []
+    for r in rows:
+        p = {
+            "id": r["id"],
+            "name": r["display_name"],
+            "family_id": r["family_id"] or None,
+            "family": r["family_name"],
+            "group": r["field_service_group_name"],
+            "tags": tags.get(r["id"], []),
+        }
+        if r["moved"]:
+            p["moved"] = True
+        if r["removed"]:
+            p["removed"] = True
+        out.append(p)
+    return out
+
+
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+
+_mcp = MCPServer(
+    name="persons-directory",
+    title="Congregation Directory",
+    instructions=(
+        "Read-only search over the congregation directory, built from the latest Persons.csv. "
+        "Start with search_persons or list_field_service_groups, then use get_person or get_family "
+        "for details. People who have moved away or been removed are left out unless include_moved "
+        "is true. Phone, email and address appear only when this API key has that scope."
+    ),
+)
+
+
+@_mcp.tool(annotations=_READ_ONLY)
+def search_persons(
+    query: str = "",
+    group: Optional[str] = None,
+    tag: Optional[str] = None,
+    include_moved: bool = False,
+    limit: int = 25,
+) -> dict:
+    """Search people by name, optionally filtered by field service group and tag.
+
+    query: words matched against first, last and display name (every word must match).
+    group: exact field service group name, e.g. "Gruber" (see list_field_service_groups).
+    tag: exact tag name, e.g. "Elder", "Regular Pioneer", "Unbaptized Publisher" (see list_tags).
+    include_moved: include people who have moved away or been removed.
+    limit: maximum results to return (1-100).
+    """
+    _log_call("search_persons", query=query, group=group, tag=tag, include_moved=include_moved, limit=limit)
+    if tag in _HIDDEN_TAGS:
+        return {"total": 0, "results": []}
+    where, params = [], []
+    for word in query.split():
+        where.append("(first_name LIKE ? OR last_name LIKE ? OR display_name LIKE ?)")
+        params += [f"%{word}%"] * 3
+    if group:
+        where.append("field_service_group_name = ? COLLATE NOCASE")
+        params.append(group)
+    if tag:
+        where.append("id IN (SELECT person_id FROM tags WHERE name = ? COLLATE NOCASE)")
+        params.append(tag)
+    if not include_moved:
+        where.append("moved = 0 AND removed = 0")
+    sql = "SELECT * FROM persons"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY last_name, first_name"
+    with closing(_mcp_db()) as conn:
+        rows = conn.execute(sql, params).fetchall()
+        limit = max(1, min(limit, 100))
+        return {"total": len(rows), "results": _person_summaries(conn, rows[:limit])}
+
+
+@_mcp.tool(annotations=_READ_ONLY)
+def get_person(person_id: int) -> dict:
+    """Get one person's details: family, group and tags, plus contact details and address
+    when this API key has the contact or address scope."""
+    _log_call("get_person", person_id=person_id)
+    scopes = _mcp_scopes()
+    with closing(_mcp_db()) as conn:
+        row = conn.execute("SELECT * FROM persons WHERE id = ?", (person_id,)).fetchone()
+        if row is None:
+            raise ToolError(f"No person with id {person_id}.")
+        person = _person_summaries(conn, [row])[0]
+    person["first_name"] = row["first_name"]
+    person["last_name"] = row["last_name"]
+    person["family_head"] = bool(row["family_head"])
+    if "contact" in scopes:
+        person["mobile"] = row["mobile"] or None
+        person["email"] = row["email"] or None
+    if "address" in scopes:
+        person["address"] = row["address"] or None
+        person["city"] = row["city"] or None
+        person["state"] = row["state"] or None
+        person["postal_code"] = row["postal_code"] or None
+    return person
+
+
+@_mcp.tool(annotations=_READ_ONLY)
+def get_family(family_id: int, include_moved: bool = False) -> dict:
+    """Get a family: its name, head, field service group and members, plus its address
+    when this API key has the address scope."""
+    _log_call("get_family", family_id=family_id, include_moved=include_moved)
+    with closing(_mcp_db()) as conn:
+        fam = conn.execute("SELECT * FROM families WHERE id = ?", (family_id,)).fetchone()
+        sql = "SELECT * FROM persons WHERE family_id = ?"
+        if not include_moved:
+            sql += " AND moved = 0 AND removed = 0"
+        members = conn.execute(sql + " ORDER BY family_head DESC, first_name", (family_id,)).fetchall()
+        if fam is None and not members:
+            raise ToolError(f"No family with id {family_id}.")
+        family = {
+            "id": family_id,
+            "name": fam["name"] if fam else members[0]["family_name"],
+            "head_id": fam["family_head_id"] if fam else None,
+            "head": fam["family_head"] if fam else None,
+            "group": fam["field_service_group_name"] if fam else members[0]["field_service_group_name"],
+            "members": _person_summaries(conn, members),
+        }
+    if fam is not None and fam["moved"]:
+        family["moved"] = True
+    if fam is not None and "address" in _mcp_scopes():
+        family["address"] = fam["address"] or None
+        family["city"] = fam["city"] or None
+        family["state"] = fam["state"] or None
+        family["postal_code"] = fam["postal_code"] or None
+    return family
+
+
+@_mcp.tool(annotations=_READ_ONLY)
+def list_field_service_groups() -> dict:
+    """List field service groups with their overseer, assistant and number of members
+    (people who have moved away are not counted)."""
+    _log_call("list_field_service_groups")
+    with closing(_mcp_db()) as conn:
+        rows = conn.execute(
+            """SELECT g.id, g.name, g.overseer, g.overseer_id, g.assistant, g.assistant_id,
+                      (SELECT COUNT(*) FROM persons p
+                        WHERE p.field_service_group_id = g.id AND p.moved = 0 AND p.removed = 0) AS members
+                 FROM field_service_groups g ORDER BY g.name"""
+        ).fetchall()
+    return {"groups": [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "overseer": r["overseer"] or None,
+            "overseer_id": r["overseer_id"] or None,
+            "assistant": r["assistant"] or None,
+            "assistant_id": r["assistant_id"] or None,
+            "members": r["members"],
+        }
+        for r in rows
+    ]}
+
+
+@_mcp.tool(annotations=_READ_ONLY)
+def list_tags() -> dict:
+    """List the tag names usable with search_persons, with how many current members have each."""
+    _log_call("list_tags")
+    hidden = _HIDDEN_TAGS | _REDUNDANT_TAGS
+    with closing(_mcp_db()) as conn:
+        rows = conn.execute(
+            f"""SELECT t.name, COUNT(DISTINCT t.person_id) AS people
+                  FROM tags t JOIN persons p ON p.id = t.person_id
+                 WHERE p.moved = 0 AND p.removed = 0
+                   AND t.name NOT IN ({','.join('?' * len(hidden))})
+                 GROUP BY t.name ORDER BY t.name""",
+            sorted(hidden),
+        ).fetchall()
+    return {"tags": [{"tag": r["name"], "people": r["people"]} for r in rows]}
+
+
+class _MCPKeyAuth:
+    """ASGI wrapper: requires `Authorization: Bearer <api key>` on every MCP request."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            header = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
+            scheme, _, token = header.partition(" ")
+            key = _check_api_key(token.strip()) if scheme.lower() == "bearer" else None
+            if key is None:
+                response = JSONResponse(
+                    {"error": "invalid_token", "error_description": "A valid API key is required."},
+                    status_code=401,
+                    headers={"WWW-Authenticate": 'Bearer realm="persons-uploader"'},
+                )
+                await response(scope, receive, send)
+                return
+            _mcp_caller.set(key)
+        await self.app(scope, receive, send)
+
+
+# Stateless JSON responses: no sessions to lose on restart, and each call stands alone.
+# host="0.0.0.0" skips the SDK's localhost-only Host check; the API key is the access control.
+_mcp_http_app = _mcp.streamable_http_app(
+    streamable_http_path="/mcp", stateless_http=True, json_response=True, host="0.0.0.0"
+)
+app.router.routes.append(Route("/mcp", endpoint=_MCPKeyAuth(_mcp_http_app)))
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 def _file_state() -> dict:
@@ -673,14 +1039,22 @@ async def download_database(user: dict = Depends(require_auth)):
 # ---------------------------------------------------------------------------
 # Admin – user management
 # ---------------------------------------------------------------------------
-@app.get("/admin", response_class=HTMLResponse)
-async def admin_get(request: Request, user: dict = Depends(require_admin)):
+def _render_admin(request: Request, user: dict, error=None, success=None, new_key=None):
     return templates.TemplateResponse(request, "admin.html", {
         "user": user,
         "users": _users,
-        "error": None,
-        "success": None,
+        "api_keys": sorted(_api_keys.values(), key=lambda k: k["created"]),
+        "scope_labels": API_KEY_SCOPES,
+        "new_key": new_key,
+        "today": datetime.now(timezone.utc).date().isoformat(),
+        "error": error,
+        "success": success,
     })
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_get(request: Request, user: dict = Depends(require_admin)):
+    return _render_admin(request, user)
 
 
 @app.post("/admin/users/add", response_class=HTMLResponse)
@@ -693,12 +1067,7 @@ async def admin_add_user(
     can_upload: Optional[str] = Form(default=None),
 ):
     def render(error=None, success=None):
-        return templates.TemplateResponse(request, "admin.html", {
-            "user": user,
-            "users": _users,
-            "error": error,
-            "success": success,
-        })
+        return _render_admin(request, user, error=error, success=success)
 
     new_username = new_username.strip()
     if not new_username:
@@ -789,3 +1158,49 @@ async def admin_edit_post(
     _users[target_username]["can_upload"] = can_upload_bool
     _save_users()
     return render(success=True)
+
+
+# ---------------------------------------------------------------------------
+# Admin – API keys for the MCP endpoint
+# ---------------------------------------------------------------------------
+@app.post("/admin/keys/add", response_class=HTMLResponse)
+async def admin_add_key(
+    request: Request,
+    user: dict = Depends(require_admin),
+    key_name: str = Form(...),
+    expires: str = Form(default=""),
+    scopes: list[str] = Form(default=[]),
+):
+    key_name = key_name.strip()
+    if not key_name:
+        return _render_admin(request, user, error="Key name cannot be blank.")
+    expires = expires.strip()
+    if expires:
+        try:
+            datetime.strptime(expires, "%Y-%m-%d")
+        except ValueError:
+            return _render_admin(request, user, error="Expiry must be a date (YYYY-MM-DD).")
+    key = _create_api_key(key_name, scopes, expires)
+    return _render_admin(request, user, success=f"API key '{key_name}' created.",
+                         new_key={"name": key_name, "key": key})
+
+
+@app.post("/admin/keys/{key_id}/rotate", response_class=HTMLResponse)
+async def admin_rotate_key(key_id: str, request: Request, user: dict = Depends(require_admin)):
+    old = _api_keys.get(key_id)
+    if old is None:
+        raise HTTPException(status_code=404, detail="API key not found.")
+    key = _create_api_key(old["name"], old["scopes"], old["expires"])
+    del _api_keys[key_id]
+    _save_api_keys()
+    return _render_admin(request, user, success=f"API key '{old['name']}' rotated; the old key no longer works.",
+                         new_key={"name": old["name"], "key": key})
+
+
+@app.post("/admin/keys/{key_id}/revoke")
+async def admin_revoke_key(key_id: str, user: dict = Depends(require_admin)):
+    if key_id not in _api_keys:
+        raise HTTPException(status_code=404, detail="API key not found.")
+    del _api_keys[key_id]
+    _save_api_keys()
+    return RedirectResponse("/admin", status_code=303)
