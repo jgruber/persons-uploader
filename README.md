@@ -88,7 +88,9 @@ uvicorn main:app --reload
 needs `Authorization: Bearer <api key>`; create keys under **API Keys** on the admin page. Only a
 SHA-256 hash of each key is stored, so the key is shown once — rotate it if it is lost.
 
-Tools: `search_persons`, `get_person`, `get_family`, `list_field_service_groups`, `list_tags`.
+Tools: `search_persons`, `search_families`, `get_person`, `get_family`, `list_field_service_groups`,
+`list_tags`. `search_families` filters families by name, group or a member tag (e.g. families with
+an elder) and returns each family's `member_count`, so family-level questions take one call per tag.
 People who have moved or been removed are left out unless `include_moved` is set.
 
 Every key sees names, families, field service groups and tags. Scopes add more:

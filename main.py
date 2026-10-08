@@ -730,8 +730,10 @@ _mcp = MCPServer(
     title="Congregation Directory",
     instructions=(
         "Read-only search over the congregation directory, built from the latest Persons.csv. "
-        "Start with search_persons or list_field_service_groups, then use get_person or get_family "
-        "for details. People who have moved away or been removed are left out unless include_moved "
+        "Start with search_persons, search_families or list_field_service_groups, then use get_person "
+        "or get_family for details. search_families answers family-level questions (e.g. families with "
+        "an elder, and how many people are in them) in one call instead of one get_family per family. "
+        "People who have moved away or been removed are left out unless include_moved "
         "is true. Phone, email and address appear only when this API key has that scope."
     ),
 )
@@ -801,6 +803,94 @@ def get_person(person_id: int) -> dict:
         person["state"] = row["state"] or None
         person["postal_code"] = row["postal_code"] or None
     return person
+
+
+@_mcp.tool(annotations=_READ_ONLY)
+def search_families(
+    query: str = "",
+    group: Optional[str] = None,
+    member_tag: Optional[str] = None,
+    include_moved: bool = False,
+    limit: int = 50,
+) -> dict:
+    """Search families, optionally keeping only those with a member who has a given tag.
+
+    query: words matched against the family name (every word must match).
+    group: exact field service group name of the family, e.g. "Gruber".
+    member_tag: exact tag name, e.g. "Elder" or "Regular Pioneer"; keeps families with at least
+        one current member carrying it, and lists those members in matched_members.
+    include_moved: include members who have moved away or been removed, in matching and counts.
+    limit: maximum families to return (1-200).
+
+    Each result has member_count, equal to the number of members get_family returns with the same
+    include_moved. total_families and total_members cover every match, not just the returned page.
+    To combine tags (e.g. elder OR regular pioneer), call once per tag and merge on family id.
+    """
+    _log_call("search_families", query=query, group=group, member_tag=member_tag,
+              include_moved=include_moved, limit=limit)
+    if member_tag in _HIDDEN_TAGS:
+        return {"total_families": 0, "total_members": 0, "results": []}
+    # Families are built from their members, so a family whose head has no row in the
+    # families table is still found, and counts always agree with get_family.
+    member_filter = "family_id > 0" + ("" if include_moved else " AND moved = 0 AND removed = 0")
+    where, params = [], []
+    for word in query.split():
+        where.append("name LIKE ?")
+        params.append(f"%{word}%")
+    if group:
+        where.append("grp = ? COLLATE NOCASE")
+        params.append(group)
+    sql = f"""
+        WITH m AS (SELECT * FROM persons WHERE {member_filter}),
+        fam AS (
+            SELECT m.family_id AS id,
+                   COALESCE(f.name, MAX(m.family_name)) AS name,
+                   f.family_head AS head, f.family_head_id AS head_id,
+                   COALESCE(f.field_service_group_name, MAX(m.field_service_group_name)) AS grp,
+                   f.moved AS moved,
+                   COUNT(*) AS member_count
+              FROM m LEFT JOIN families f ON f.id = m.family_id
+             GROUP BY m.family_id
+        )
+        SELECT * FROM fam"""
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY name, id"
+    with closing(_mcp_db()) as conn:
+        families = conn.execute(sql, params).fetchall()
+        matched: dict[int, list[dict]] = {}
+        if member_tag:
+            rows = conn.execute(
+                f"""SELECT id, display_name, family_id FROM persons
+                     WHERE {member_filter}
+                       AND id IN (SELECT person_id FROM tags WHERE name = ? COLLATE NOCASE)
+                     ORDER BY first_name""",
+                (member_tag,),
+            ).fetchall()
+            for r in rows:
+                matched.setdefault(r["family_id"], []).append({"id": r["id"], "name": r["display_name"]})
+            families = [f for f in families if f["id"] in matched]
+    limit = max(1, min(limit, 200))
+    results = []
+    for f in families[:limit]:
+        fam = {
+            "id": f["id"],
+            "name": f["name"],
+            "head_id": f["head_id"],
+            "head": f["head"],
+            "group": f["grp"],
+            "member_count": f["member_count"],
+        }
+        if f["moved"]:
+            fam["moved"] = True
+        if member_tag:
+            fam["matched_members"] = matched[f["id"]]
+        results.append(fam)
+    return {
+        "total_families": len(families),
+        "total_members": sum(f["member_count"] for f in families),
+        "results": results,
+    }
 
 
 @_mcp.tool(annotations=_READ_ONLY)
