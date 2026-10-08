@@ -577,6 +577,9 @@ def _csv_to_sqlite(csv_path: Path) -> str:
 API_KEY_SCOPES = {
     "contact": "Phone and email",
     "address": "Street address, city and ZIP",
+    "contact_details": "All contact details: every phone, email and address, birth, baptism, "
+                       "appointment, pioneer and removal dates, and personal circumstances",
+    "extended_attributes": "How each person is used: meeting parts, assignments and hall duties",
 }
 
 
@@ -696,9 +699,103 @@ def _add_custom_tags(db_path: str) -> None:
         conn.close()
 
 
+# Extended attributes: how each person is used in the congregation. Mirrors the useForMap in
+# congregation-directory (same Persons.csv columns, labels and categories). Stored in the MCP DB
+# with tag type 'extended' and shown only to keys with the extended_attributes scope.
+_EXTENDED_CATEGORIES = {
+    "usefor": "Meeting Assignments",
+    "treasures": "Treasures from God's Word",
+    "student": "OCLM / Student",
+    "living": "Living as Christians",
+    "cbs": "Congregation Bible Study",
+    "public": "Public Meeting",
+    "service": "Field Service",
+    "duty": "Hall Duties",
+}
+_EXTENDED_TAGS = [
+    ("UseForChairman", "usefor", "Midweek Chairman"),
+    ("UseForAuxiliaryCounselor", "usefor", "Midweek Classroom Counselor"),
+    ("UseForPrayers", "usefor", "Prayer"),
+    ("UseForTreasuresTalk", "treasures", "Treasure from God's Word"),
+    ("UseForTreasuresGems", "treasures", "Digging for Spiritual Gems"),
+    ("UseForTreasuresBR", "student", "Bible Reading"),
+    ("UseForApplyIC", "student", "Initial Call"),
+    ("UseForApplyRV", "student", "Follow Up"),
+    ("UseForApplyBS", "student", "Making Disciples"),
+    ("UseForApplyExplaining", "student", "Explaining Beliefs"),
+    ("UseForApplyStudentTalk", "student", "Talks"),
+    ("UseForApplyAssistant", "student", "Assistant"),
+    ("UseForLivingParts", "living", "Living as Christians Parts"),
+    ("UseForCBS", "cbs", "Congregation Bible Study Conductor"),
+    ("UseForCBSReader", "cbs", "Congregation Bible Study Reader"),
+    ("UseForPublicTalksLocal", "public", "Local Public Talks"),
+    ("UseForPublicTalksAway", "public", "Away Public Talks"),
+    ("UseForWeekendChairman", "public", "Weekend Chairman"),
+    ("UseForWatchtowerReader", "public", "Watchtower Reader"),
+    ("UseForPublicWitnessing", "service", "Local Public Witnessing"),
+    ("UseForPublicWitnessingKeyPerson", "service", "Local Public Witnessing Key Person"),
+    ("UseForConductFSGroups", "service", "Meeting for Field Service Conductor"),
+    ("UseForFSPrayers", "service", "Meeting for Field Service Prayer"),
+    ("UseForMaintenance", "service", "Local Maintenance Volunteer"),
+    ("UseForDuty1", "duty", "Auditorium Attendant"),
+    ("UseForDuty2", "duty", "Entrance Attendant"),
+    ("UseForDuty3", "duty", "Video Conference Host"),
+    ("UseForDuty4", "duty", "Microphone Carrier"),
+    ("UseForDuty6", "duty", "Audio/Video Operator"),
+    ("UseForDuty7", "duty", "Stage Attendant"),
+    ("UseForHospitality", "duty", "Hospitality"),
+    ("UseForCleaningType1", "duty", "Weekly Hall Clean"),
+    ("UseForCleaningType2", "duty", "After Meeting Clean"),
+    ("UseForCleaningType3", "duty", "Monthly Hall Clean"),
+    ("UseForCleaningType4", "duty", "Quarterly Hall Clean"),
+    ("UseForGardenCareType1", "duty", "Flowerbeds"),
+    ("UseForGardenCareType2", "duty", "Lawn"),
+]
+_EXTENDED_CATEGORY_OF = {label: _EXTENDED_CATEGORIES[cat] for _, cat, label in _EXTENDED_TAGS}
+
+
+def _add_csv_extras(db_path: str, csv_path: Path) -> None:
+    """Add what the MCP needs from Persons.csv beyond the shared schema: the contact-details
+    fields with no persons column, and the extended-attribute tags."""
+    raw = csv_path.read_bytes()
+    if raw[:3] == b"\xef\xbb\xbf":
+        raw = raw[3:]
+    rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8", errors="replace"))))
+    extras, tags = [], []
+    for row in rows:
+        pid = int(row.get("PersonID") or 0) or 0
+        if not pid:
+            continue
+        extras.append((
+            pid,
+            (row.get("PhoneHome") or "").strip(),
+            (row.get("PhoneWork") or "").strip(),
+            (row.get("Email2") or "").strip(),
+            (row.get("DateOfPrivilege") or "").strip(),
+            (row.get("DateOfFirstMonth") or "").strip(),
+        ))
+        for col, _cat, label in _EXTENDED_TAGS:
+            if row.get(col) == "True":
+                tags.append((pid, "extended", label, ""))
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("""CREATE TABLE person_extras (
+            person_id INTEGER PRIMARY KEY, phone_home TEXT, phone_work TEXT, email2 TEXT,
+            date_of_privilege TEXT, date_of_first_month TEXT)""")
+        conn.executemany("INSERT OR REPLACE INTO person_extras VALUES (?,?,?,?,?,?)", extras)
+        conn.executemany("INSERT INTO tags VALUES (?,?,?,?)", tags)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# Bump when the MCP DB layout changes, so caches built by an older release are rebuilt
+_MCP_DB_VERSION = 2
+
+
 def _mcp_sources_signature() -> str:
     """Changes whenever Persons.csv or any tag file is replaced, added or deleted."""
-    parts = []
+    parts = [f"v{_MCP_DB_VERSION}"]
     for path in [UPLOAD_DIR / "Persons.csv", *_tag_files()]:
         try:
             st = path.stat()
@@ -719,6 +816,7 @@ def _mcp_db() -> sqlite3.Connection:
         current = sig_path.read_text() if sig_path.exists() else None
         if not MCP_DB_PATH.exists() or current != signature:
             tmp_path = _csv_to_sqlite(csv_path)
+            _add_csv_extras(tmp_path, csv_path)
             _add_custom_tags(tmp_path)
             staged = MCP_DB_PATH.with_suffix(".tmp")
             shutil.move(tmp_path, staged)
@@ -732,6 +830,13 @@ def _mcp_db() -> sqlite3.Connection:
 def _mcp_scopes() -> set[str]:
     key = _mcp_caller.get()
     return set(key["scopes"]) if key else set()
+
+
+def _tag_type_filter(alias: str = "") -> str:
+    """SQL condition hiding extended-attribute tags from keys without that scope."""
+    if "extended_attributes" in _mcp_scopes():
+        return "1"
+    return f"{alias}type != 'extended'"
 
 
 def _log_call(tool: str, **args) -> None:
@@ -757,7 +862,9 @@ def _tags_for(conn: sqlite3.Connection, ids: list[int]) -> dict[int, list[str]]:
     if not ids:
         return out
     rows = conn.execute(
-        f"SELECT person_id, name, value FROM tags WHERE person_id IN ({','.join('?' * len(ids))})", ids
+        f"SELECT person_id, name, value FROM tags WHERE person_id IN ({','.join('?' * len(ids))}) "
+        f"AND {_tag_type_filter()}",
+        ids,
     )
     for r in rows:
         if r["name"] in _HIDDEN_TAGS or r["name"] in _REDUNDANT_TAGS:
@@ -801,7 +908,9 @@ _mcp = MCPServer(
         "an elder, and how many people are in them) in one call instead of one get_family per family. "
         "People who have moved away or been removed are left out unless include_moved "
         "is true. Tags include custom tags uploaded by the congregation (marked custom in list_tags). "
-        "Phone, email and address appear only when this API key has that scope."
+        "Phone, email and address appear only when this API key has that scope; the contact_details "
+        "scope adds personal dates and circumstances, and extended_attributes adds tags for how each "
+        "person is used (meeting parts, assignments, hall duties)."
     ),
 )
 
@@ -833,7 +942,7 @@ def search_persons(
         where.append("field_service_group_name = ? COLLATE NOCASE")
         params.append(group)
     if tag:
-        where.append("id IN (SELECT person_id FROM tags WHERE name = ? COLLATE NOCASE)")
+        where.append(f"id IN (SELECT person_id FROM tags WHERE name = ? COLLATE NOCASE AND {_tag_type_filter()})")
         params.append(tag)
     if not include_moved:
         where.append("moved = 0 AND removed = 0")
@@ -849,8 +958,10 @@ def search_persons(
 
 @_mcp.tool(annotations=_READ_ONLY)
 def get_person(person_id: int) -> dict:
-    """Get one person's details: family, group and tags, plus contact details and address
-    when this API key has the contact or address scope."""
+    """Get one person's details: family, group and tags. Depending on this API key's scopes it
+    also includes phone and email (contact), address (address), or every phone, email and address
+    plus birth, baptism, appointment, pioneer and removal dates and personal circumstances
+    (contact_details)."""
     _log_call("get_person", person_id=person_id)
     scopes = _mcp_scopes()
     with closing(_mcp_db()) as conn:
@@ -858,17 +969,34 @@ def get_person(person_id: int) -> dict:
         if row is None:
             raise ToolError(f"No person with id {person_id}.")
         person = _person_summaries(conn, [row])[0]
+        extras = conn.execute("SELECT * FROM person_extras WHERE person_id = ?", (person_id,)).fetchone()
     person["first_name"] = row["first_name"]
     person["last_name"] = row["last_name"]
     person["family_head"] = bool(row["family_head"])
-    if "contact" in scopes:
+    full = "contact_details" in scopes
+    if full or "contact" in scopes:
         person["mobile"] = row["mobile"] or None
         person["email"] = row["email"] or None
-    if "address" in scopes:
+    if full or "address" in scopes:
         person["address"] = row["address"] or None
         person["city"] = row["city"] or None
         person["state"] = row["state"] or None
         person["postal_code"] = row["postal_code"] or None
+    if full:
+        person["phone_home"] = (extras["phone_home"] if extras else "") or None
+        person["phone_work"] = (extras["phone_work"] if extras else "") or None
+        person["email2"] = (extras["email2"] if extras else "") or None
+        person["gender"] = row["gender"] or None
+        person["date_of_birth"] = row["date_of_birth"] or None
+        person["date_of_baptism"] = row["date_of_baptism"] or None
+        person["date_of_appointment"] = (extras["date_of_privilege"] if extras else "") or None
+        person["pioneer_start_date"] = (extras["date_of_first_month"] if extras else "") or None
+        person["date_removed"] = row["date_removed"] or None
+        person["anointed"] = bool(row["anointed"])
+        person["elderly_infirm"] = bool(row["infirm"])
+        person["blind"] = bool(row["bind"])
+        person["deaf"] = bool(row["deaf"])
+        person["child"] = bool(row["child"])
     return person
 
 
@@ -930,7 +1058,8 @@ def search_families(
             rows = conn.execute(
                 f"""SELECT id, display_name, family_id FROM persons
                      WHERE {member_filter}
-                       AND id IN (SELECT person_id FROM tags WHERE name = ? COLLATE NOCASE)
+                       AND id IN (SELECT person_id FROM tags
+                                   WHERE name = ? COLLATE NOCASE AND {_tag_type_filter()})
                      ORDER BY first_name""",
                 (member_tag,),
             ).fetchall()
@@ -963,7 +1092,7 @@ def search_families(
 @_mcp.tool(annotations=_READ_ONLY)
 def get_family(family_id: int, include_moved: bool = False) -> dict:
     """Get a family: its name, head, field service group and members, plus its address
-    when this API key has the address scope."""
+    when this API key has the address or contact_details scope."""
     _log_call("get_family", family_id=family_id, include_moved=include_moved)
     with closing(_mcp_db()) as conn:
         fam = conn.execute("SELECT * FROM families WHERE id = ?", (family_id,)).fetchone()
@@ -983,7 +1112,7 @@ def get_family(family_id: int, include_moved: bool = False) -> dict:
         }
     if fam is not None and fam["moved"]:
         family["moved"] = True
-    if fam is not None and "address" in _mcp_scopes():
+    if fam is not None and _mcp_scopes() & {"address", "contact_details"}:
         family["address"] = fam["address"] or None
         family["city"] = fam["city"] or None
         family["state"] = fam["state"] or None
@@ -1021,22 +1150,30 @@ def list_field_service_groups() -> dict:
 def list_tags() -> dict:
     """List the tag names usable with search_persons and search_families, with how many current
     members have each. Tags marked custom come from tag files uploaded by the congregation
-    (e.g. "English Elders") rather than from Persons.csv."""
+    (e.g. "English Elders") rather than from Persons.csv. With the extended_attributes scope this
+    also lists how people are used (meeting parts, assignments, hall duties), each with its
+    category."""
     _log_call("list_tags")
     hidden = _HIDDEN_TAGS | _REDUNDANT_TAGS
     with closing(_mcp_db()) as conn:
         rows = conn.execute(
-            f"""SELECT t.name, MAX(t.type = 'custom') AS custom, COUNT(DISTINCT t.person_id) AS people
+            f"""SELECT t.name, MAX(t.type = 'custom') AS custom, MAX(t.type = 'extended') AS extended,
+                       COUNT(DISTINCT t.person_id) AS people
                   FROM tags t JOIN persons p ON p.id = t.person_id
-                 WHERE p.moved = 0 AND p.removed = 0
+                 WHERE p.moved = 0 AND p.removed = 0 AND {_tag_type_filter('t.')}
                    AND t.name NOT IN ({','.join('?' * len(hidden))})
                  GROUP BY t.name ORDER BY t.name""",
             sorted(hidden),
         ).fetchall()
-    return {"tags": [
-        {"tag": r["name"], "people": r["people"], **({"custom": True} if r["custom"] else {})}
-        for r in rows
-    ]}
+    tags = []
+    for r in rows:
+        tag = {"tag": r["name"], "people": r["people"]}
+        if r["custom"]:
+            tag["custom"] = True
+        if r["extended"]:
+            tag["category"] = _EXTENDED_CATEGORY_OF.get(r["name"])
+        tags.append(tag)
+    return {"tags": tags}
 
 
 class _MCPKeyAuth:
