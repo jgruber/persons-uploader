@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Nightly encrypted backup of persons-uploader (change history, logins, API keys, tag files),
+# run on the Docker host after the nightly Persons.csv upload.
+#
+#   persons-uploader-backup run           back up now, verify it opens, keep the newest $KEEP
+#   persons-uploader-backup verify FILE   check that a backup opens with the stored passphrase
+#   persons-uploader-backup restore FILE  put a backup's files back (then restart the container)
+#   persons-uploader-backup list          the backups on hand
+#
+# Uses the same passphrase file as Shepherd's Notebook's backup: set it with
+# `shepherd-backup set-passphrase`. Override any of these in /etc/default/persons-uploader-backup.
+set -euo pipefail
+
+CONTAINER="${CONTAINER:-persons-uploader-allen}"
+DEST="${DEST:-/media/docs/persons-uploader}"
+KEEP="${KEEP:-30}"
+PASSFILE="${PASSFILE:-/root/.config/shepherd-backup/passphrase}"
+[ -r /etc/default/persons-uploader-backup ] && . /etc/default/persons-uploader-backup
+
+die() { echo "persons-uploader-backup: $*" >&2; exit 1; }
+
+need_passphrase() {
+  [ -s "$PASSFILE" ] || die "no passphrase stored - run: shepherd-backup set-passphrase"
+}
+
+need_nas() {
+  # Never fall back to the local disk: a backup on the machine it must survive is not a backup.
+  local parent fstype
+  parent="$DEST"
+  while [ ! -d "$parent" ]; do parent="$(dirname "$parent")"; done
+  fstype="$(findmnt -n -o FSTYPE -T "$parent" || true)"
+  case "$fstype" in
+    cifs|smb3|nfs|nfs4) ;;
+    *) die "$parent is not a network share (found '${fstype:-nothing}') - is the NAS mounted?" ;;
+  esac
+  mkdir -p "$DEST"
+}
+
+with_backup() {   # passphrase line, then the file, into backup.py $1
+  { cat "$PASSFILE"; cat "$2"; } | docker exec -i "$CONTAINER" python backup.py "$1"
+}
+
+case "${1:-run}" in
+  run)
+    need_passphrase
+    need_nas
+    stamp="$(TZ="${TZ:-America/Chicago}" date +%Y-%m-%d-%H%M)"
+    file="$DEST/persons-uploader-$stamp.pubackup"
+    trap 'rm -f "$file.part"' EXIT
+    docker exec -i "$CONTAINER" python backup.py create < "$PASSFILE" > "$file.part"
+    with_backup verify "$file.part"
+    mv "$file.part" "$file"
+    trap - EXIT
+    echo "wrote $file ($(stat -c %s "$file") bytes)"
+    ls -1t "$DEST"/persons-uploader-*.pubackup 2>/dev/null | tail -n +"$((KEEP + 1))" | while read -r old; do
+      rm -f -- "$old" && echo "removed $old"
+    done
+    ;;
+  verify)
+    need_passphrase
+    [ -n "${2:-}" ] && [ -f "$2" ] || die "usage: persons-uploader-backup verify FILE"
+    with_backup verify "$2"
+    ;;
+  restore)
+    need_passphrase
+    [ -n "${2:-}" ] && [ -f "$2" ] || die "usage: persons-uploader-backup restore FILE"
+    with_backup restore "$2"
+    docker restart "$CONTAINER" >/dev/null && echo "restarted $CONTAINER"
+    ;;
+  list)
+    ls -lh "$DEST"/persons-uploader-*.pubackup 2>/dev/null || echo "no backups in $DEST"
+    ;;
+  *)
+    die "usage: persons-uploader-backup [run|verify FILE|restore FILE|list]"
+    ;;
+esac

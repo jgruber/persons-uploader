@@ -1,0 +1,9 @@
+[Unit]
+Description=persons-uploader - nightly backup at 02:45 Central, after the nightly upload
+
+[Timer]
+OnCalendar=*-*-* 02:45:00 America/Chicago
+Persistent=true
+
+[Install]
+WantedBy=timers.target

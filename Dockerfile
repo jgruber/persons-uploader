@@ -2,12 +2,17 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# The DejaVu font lets the monthly-changes PDF print every name
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fonts-dejavu-core \
+ && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies first (layer-cached until requirements change)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY main.py .
+COPY main.py history.py backup.py ./
 COPY templates/ templates/
 COPY static/ static/
 

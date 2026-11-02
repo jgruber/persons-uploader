@@ -11,6 +11,10 @@ A web-based file management service for uploading and sharing `Persons.csv` and 
 - Download files (with no-cache headers for always-fresh data)
 - Role-based access: **Uploaders** (full access) and **Viewers** (download only)
 - User management admin panel
+- Monthly change history: every upload is compared with the last, and what changed among the
+  persons (added, moved, removed, appointments, baptisms, activity, group, address, phone, anointed)
+  is kept for 48 months - see [Change history](#change-history)
+- Nightly encrypted backup of the history, logins, API keys and tag files to a NAS folder
 - Read-only MCP endpoint (`/mcp`) so remote agents can search the directory, with API keys managed in the admin panel
 - Drag-and-drop upload UI with progress tracking
 
@@ -81,6 +85,56 @@ uvicorn main:app --reload
 | `POST` | `/admin/keys/{id}/rotate` | Uploader | Replace a key, keeping its name and scopes |
 | `POST` | `/admin/keys/{id}/revoke` | Uploader | Revoke a key |
 | `POST` | `/mcp` | API key | MCP endpoint (streamable HTTP) |
+| `GET` | `/changes?month=YYYY-MM` | Any | Monthly changes page |
+| `GET` | `/changes/report?month=YYYY-MM&format=pdf\|md\|json` | Any | Monthly changes download |
+
+## Change history
+
+`history.py` compares each uploaded `Persons.csv` with the last state it recorded (by PersonID) and
+keeps two tables in `$UPLOAD_DIR/.history/history.sqlite`:
+
+- `person_versions` - one row per person per stretch of time in which the tracked fields stayed the
+  same (`valid_from`..`valid_to`). The source of truth: what a person looked like on any day.
+- `person_changes` - one row per change: who, what, the day it was detected, the day it took effect
+  when the export says (baptism, appointment, pioneer and removal dates), old and new values.
+
+| Section | Change types |
+|---------|--------------|
+| Added | `added`, `returned_to_export` |
+| Moved | `moved`, `moved_back` |
+| Removed | `removed`, `reinstated`, `dropped_from_export` (no longer in the export at all) |
+| Appointments | `appointed_elder`, `appointed_ms`, `appointed_regular_pioneer`, `appointed_special_pioneer` |
+| Appointments ended | `no_longer_elder`, `no_longer_ms`, `regular_pioneer_ended`, `special_pioneer_ended` |
+| Newly baptized | `baptized` |
+| Publishers | `new_publisher` (Privilege No -> UBP), `reactivated`, `became_inactive` |
+| Field service groups / Addresses / Phone numbers | `group_changed`, `address_changed`, `phone_changed` |
+| Anointed | `anointed_changed` |
+
+The first import is a baseline. An identical file on a new night is recorded as a night checked
+with no changes. Anything older than 48 months is deleted on each import. **Monthly changes** on the
+home page shows a month with PDF, Markdown and JSON downloads; agents use `person_changes` and
+`person_change_history` (address and phone values need the `address` / `contact` scope; dates and
+anointed status need `contact_details`). Seed it from archived exports, oldest first:
+
+```bash
+python history.py backfill archive/2026-10-26_Persons.csv archive/2026-10-27_Persons.csv ...
+```
+
+## Backups
+
+`backup.py` seals the history, `credentials.json`, the API keys, the tag files and the latest CSV
+with a passphrase (scrypt, then AES-256-GCM). `deploy/persons-uploader-backup` runs nightly on the
+host at 02:45 Central (after the upload), writes to `/media/docs/persons-uploader`, verifies each
+file and keeps 30. It shares Shepherd's Notebook's passphrase file
+(`shepherd-backup set-passphrase`).
+
+```bash
+install -m 0755 deploy/persons-uploader-backup /usr/local/bin/
+install -m 0644 deploy/persons-uploader-backup.{service,timer} /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now persons-uploader-backup.timer
+
+persons-uploader-backup restore /media/docs/persons-uploader/persons-uploader-....pubackup
+```
 
 ## MCP Endpoint
 

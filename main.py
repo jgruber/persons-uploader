@@ -19,13 +19,15 @@ from typing import Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from starlette.routing import Route
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import Environment, FileSystemLoader
+import history
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
@@ -33,9 +35,17 @@ from mcp_types import ToolAnnotations
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    # The MCP session manager (defined further down) needs its task group running
-    async with _mcp.session_manager.run():
-        yield
+    # The MCP session manager can be started only once, so each start of the app (once in
+    # production, once per test) builds a fresh one; _MCPKeyAuth forwards to the current one.
+    global _mcp_http_app
+    _mcp_http_app = _mcp.streamable_http_app(
+        streamable_http_path="/mcp", stateless_http=True, json_response=True, host="0.0.0.0"
+    )
+    try:
+        async with _mcp.session_manager.run():
+            yield
+    finally:
+        _mcp_http_app = None
 
 
 app = FastAPI(title="Persons Uploader", lifespan=_lifespan)
@@ -52,7 +62,7 @@ app.add_middleware(
 # Configuration
 # ---------------------------------------------------------------------------
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
-CREDENTIALS_FILE = Path("credentials.json")
+CREDENTIALS_FILE = Path(os.getenv("CREDENTIALS_FILE", "credentials.json"))
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -910,7 +920,8 @@ _mcp = MCPServer(
         "is true. Tags include custom tags uploaded by the congregation (marked custom in list_tags). "
         "Phone, email and address appear only when this API key has that scope; the contact_details "
         "scope adds personal dates and circumstances, and extended_attributes adds tags for how each "
-        "person is used (meeting parts, assignments, hall duties)."
+        "person is used (meeting parts, assignments, hall duties). person_changes summarizes what "
+        "changed in a month (added, moved, appointments, baptisms, activity, group, address, phone)."
     ),
 )
 
@@ -1176,11 +1187,96 @@ def list_tags() -> dict:
     return {"tags": tags}
 
 
+def _redact_change(r: dict, scopes: set[str]) -> dict | None:
+    """A change as this key may see it - or None when it may not see it at all."""
+    full = "contact_details" in scopes
+    if r["change_type"] == "anointed_changed" and not full:
+        return None                       # a personal circumstance: contact_details only
+    out = {k: r[k] for k in ("person_id", "person_name", "change_type", "label", "section",
+                             "detected_on", "effective_on", "old_value", "new_value")}
+    if r["change_type"] == "address_changed" and not (full or "address" in scopes):
+        out["old_value"] = out["new_value"] = "(withheld - needs the address scope)"
+    if r["change_type"] == "phone_changed" and not (full or "contact" in scopes):
+        out["old_value"] = out["new_value"] = "(withheld - needs the contact scope)"
+    if not full:
+        out["effective_on"] = None        # baptism, appointment and pioneer dates
+        if r["change_type"] == "baptized":
+            out["old_value"] = out["new_value"] = None
+    return out
+
+
+@_mcp.tool(annotations=_READ_ONLY)
+def person_changes(
+    month: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    change_type: Optional[str] = None,
+) -> dict:
+    """What changed among the congregation's persons over a month or date range, detected from
+    the nightly Persons.csv: added, moved, removed, appointments (elder, ministerial servant,
+    regular and special pioneer) and their ending, newly baptized, new publishers, reactivated,
+    became inactive, field service group, home address and phone changes, anointed status.
+
+    month: "YYYY-MM" (default: the current month). Or since / until as YYYY-MM-DD (until is
+        exclusive).
+    change_type: only one kind, e.g. "appointed_elder", "reactivated", "group_changed".
+
+    Changes are grouped by section with counts. complete=false means tracking began during the
+    period, so earlier changes are not known. Address and phone values need the address /
+    contact scope; dates and anointed status need contact_details.
+    """
+    _log_call("person_changes", month=month, since=since, until=until, change_type=change_type)
+    scopes = _mcp_scopes()
+    if change_type and change_type not in history.CHANGE_TYPES:
+        raise ToolError(f"change_type must be one of: {', '.join(history.CHANGE_TYPES)}")
+    try:
+        if since or until:
+            start = since or "0000-01-01"
+            end = until or "9999-12-31"
+            for v in (start, end):
+                if not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+                    raise ValueError("since and until must be YYYY-MM-DD")
+            label = f"{start} to {end}"
+        else:
+            label = month or history.local_today().strftime("%Y-%m")
+            start, end = history.month_bounds(label)
+    except ValueError as e:
+        raise ToolError(str(e))
+    rows = [x for x in (_redact_change(r, scopes)
+                        for r in history.changes(start, end, change_type=change_type)) if x]
+    sections: dict[str, list] = {}
+    for r in rows:
+        sections.setdefault(r.pop("section"), []).append(r)
+    with closing(history.connect()) as db:
+        first = db.execute("SELECT MIN(as_of) FROM imports").fetchone()[0]
+        nights = db.execute("SELECT COUNT(*) FROM imports WHERE as_of >= ? AND as_of < ?",
+                            (start, end)).fetchone()[0]
+    return {
+        "period": label,
+        "tracking_since": first,
+        "complete": bool(first) and first < start,
+        "nightly_uploads_in_period": nights,
+        "total": len(rows),
+        "counts": {s: len(v) for s, v in sections.items()},
+        "sections": sections,
+    }
+
+
+@_mcp.tool(annotations=_READ_ONLY)
+def person_change_history(person_id: int) -> dict:
+    """Every recorded change for one person (id from search_persons), oldest first, kept for
+    48 months."""
+    _log_call("person_change_history", person_id=person_id)
+    scopes = _mcp_scopes()
+    record = history.person_history(person_id)
+    rows = [x for x in (_redact_change(r, scopes) for r in record["changes"]) if x]
+    for r in rows:
+        r.pop("section", None)
+    return {"person_id": person_id, "changes": rows}
+
+
 class _MCPKeyAuth:
     """ASGI wrapper: requires `Authorization: Bearer <api key>` on every MCP request."""
-
-    def __init__(self, app):
-        self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
@@ -1196,15 +1292,16 @@ class _MCPKeyAuth:
                 await response(scope, receive, send)
                 return
             _mcp_caller.set(key)
-        await self.app(scope, receive, send)
+        if _mcp_http_app is None:
+            await JSONResponse({"error": "starting"}, status_code=503)(scope, receive, send)
+            return
+        await _mcp_http_app(scope, receive, send)
 
 
-# Stateless JSON responses: no sessions to lose on restart, and each call stands alone.
-# host="0.0.0.0" skips the SDK's localhost-only Host check; the API key is the access control.
-_mcp_http_app = _mcp.streamable_http_app(
-    streamable_http_path="/mcp", stateless_http=True, json_response=True, host="0.0.0.0"
-)
-app.router.routes.append(Route("/mcp", endpoint=_MCPKeyAuth(_mcp_http_app)))
+# Stateless JSON responses; built per app start in _lifespan. host="0.0.0.0" skips the SDK's
+# localhost-only Host check - the API key is the access control.
+_mcp_http_app = None
+app.router.routes.append(Route("/mcp", endpoint=_MCPKeyAuth()))
 
 
 # ---------------------------------------------------------------------------
@@ -1239,7 +1336,17 @@ async def upload(
     contents = await file.read()
     (UPLOAD_DIR / "Persons.csv").write_bytes(contents)
 
-    return JSONResponse({"message": f"Persons.csv saved successfully ({len(contents):,} bytes)."})
+    # Record the night's changes. A failure here must not lose the upload itself.
+    try:
+        recorded = await run_in_threadpool(history.ingest, contents, None, f"upload by {user['username']}")
+    except Exception:
+        _log.exception("Change history could not record this upload")
+        recorded = {"error": "the change history could not record this upload - see the log"}
+    message = f"Persons.csv saved successfully ({len(contents):,} bytes)."
+    if "changes" in recorded:
+        message += (" Change history: baseline recorded." if recorded.get("baseline")
+                    else f" Change history: {recorded['changes']} change(s) recorded.")
+    return JSONResponse({"message": message, "history": recorded})
 
 
 @app.post("/upload/tags")
@@ -1338,6 +1445,46 @@ async def download_database(user: dict = Depends(require_auth)):
 # ---------------------------------------------------------------------------
 # Admin – user management
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Monthly changes
+# ---------------------------------------------------------------------------
+@app.get("/changes", response_class=HTMLResponse)
+async def changes_page(request: Request, month: Optional[str] = None, user: dict = Depends(require_auth)):
+    month = month or history.local_today().strftime("%Y-%m")
+    try:
+        summary = await run_in_threadpool(history.month_summary, month)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    y, m = int(month[:4]), int(month[5:7])
+    prev_month = f"{y - (m == 1)}-{12 if m == 1 else m - 1:02d}"
+    next_month = f"{y + (m == 12)}-{1 if m == 12 else m + 1:02d}"
+    return templates.TemplateResponse(request, "changes.html", {
+        "user": user, "summary": summary, "month": month,
+        "prev_month": prev_month, "next_month": next_month,
+        "value": history._value,
+    })
+
+
+@app.get("/changes/report")
+async def changes_report(month: str, format: str = "pdf", user: dict = Depends(require_auth)):
+    try:
+        summary = await run_in_threadpool(history.month_summary, month)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    name = f"congregation-changes-{month}"
+    if format == "md":
+        return Response(history.summary_markdown(summary), media_type="text/markdown; charset=utf-8",
+                        headers={**_NO_CACHE_HEADERS, "Content-Disposition": f'attachment; filename="{name}.md"'})
+    if format == "json":
+        return JSONResponse(summary, headers={**_NO_CACHE_HEADERS,
+                                              "Content-Disposition": f'attachment; filename="{name}.json"'})
+    if format == "pdf":
+        body = await run_in_threadpool(history.summary_pdf, summary)
+        return Response(body, media_type="application/pdf",
+                        headers={**_NO_CACHE_HEADERS, "Content-Disposition": f'attachment; filename="{name}.pdf"'})
+    raise HTTPException(status_code=400, detail="format must be pdf, md or json")
+
+
 def _render_admin(request: Request, user: dict, error=None, success=None, new_key=None):
     return templates.TemplateResponse(request, "admin.html", {
         "user": user,

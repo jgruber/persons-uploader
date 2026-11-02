@@ -1,0 +1,9 @@
+[Unit]
+Description=persons-uploader - nightly encrypted backup to the NAS
+After=docker.service remote-fs.target
+Requires=docker.service
+RequiresMountsFor=/media/docs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/persons-uploader-backup run
