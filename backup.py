@@ -7,7 +7,7 @@ logins, API keys and custom tag files are typed in by people. A backup holds:
 
 * `history.sqlite` - a consistent online copy, integrity-checked
 * `credentials.json`, `.mcp/api_keys.json`, the `tag_*.json` files
-* the latest `Persons.csv`
+* the latest `Persons.csv` and `Emergency-Contacts.csv` (without its notes)
 
 sealed with a passphrase in the same format Shepherd's Notebook uses (scrypt,
 then AES-256-GCM over a zip, the header as associated data), so one passphrase
@@ -54,6 +54,7 @@ def _paths() -> dict[str, Path]:
         "credentials": Path(os.getenv("CREDENTIALS_FILE", "credentials.json")),
         "api_keys": Path(os.getenv("MCP_STATE_DIR", str(upload / ".mcp"))) / "api_keys.json",
         "persons": upload / "Persons.csv",
+        "emergency": upload / "Emergency-Contacts.csv",
     }
 
 
@@ -100,7 +101,8 @@ def create(passphrase: str) -> tuple[bytes, dict]:
             archive.write(copy, "history.sqlite")
         for name, path in (("credentials.json", paths["credentials"]),
                            ("api_keys.json", paths["api_keys"]),
-                           ("Persons.csv", paths["persons"])):
+                           ("Persons.csv", paths["persons"]),
+                           ("Emergency-Contacts.csv", paths["emergency"])):
             if path.is_file():
                 archive.write(path, name)
                 contents[name] = path.stat().st_size
@@ -197,6 +199,8 @@ def restore(data: bytes, passphrase: str) -> dict:
         put("api_keys.json", paths["api_keys"])
     if "Persons.csv" in names:
         put("Persons.csv", paths["persons"])
+    if "Emergency-Contacts.csv" in names:
+        put("Emergency-Contacts.csv", paths["emergency"])
     for member in names:
         if member.startswith("tags/") and member.endswith(".json"):
             put(member, paths["upload_dir"] / Path(member).name)

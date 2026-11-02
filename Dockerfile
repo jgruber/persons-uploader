@@ -12,7 +12,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY main.py history.py backup.py ./
+COPY main.py history.py backup.py emergency.py ./
 COPY templates/ templates/
 COPY static/ static/
 

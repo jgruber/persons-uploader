@@ -144,6 +144,53 @@
       </form>
     </div>
 
+    <!-- Emergency contacts -->
+    <div id="emergency" class="bg-white rounded-2xl shadow-lg overflow-hidden">
+      <div class="px-6 py-4 border-b border-gray-100">
+        <h2 class="font-semibold text-gray-700">Emergency contacts</h2>
+        <p class="text-xs text-gray-400 mt-1">
+          From <code class="bg-gray-100 px-1 rounded">Emergency-Contacts.csv</code>, uploaded to
+          <code class="bg-gray-100 px-1 rounded">/upload?emergency_contacts</code>. Only name,
+          relationship, email, mobile and phone are kept, in the export's order &mdash; notes are never stored.
+        </p>
+      </div>
+      <div class="px-6 py-4 space-y-3 text-sm">
+        {% if not emergency_exists %}
+        <p class="text-gray-500">No emergency contacts have been uploaded.</p>
+        {% elif not emergency %}
+        <p class="text-gray-500">Emergency-Contacts.csv is stored; upload Persons.csv to link it to persons.</p>
+        {% else %}
+        <p class="text-gray-700">
+          <span class="font-semibold">{{ emergency.linked }}</span> contacts linked to
+          <span class="font-semibold">{{ emergency.persons }}</span> persons.
+        </p>
+        {% if emergency.unlinked %}
+        <div class="rounded-xl bg-amber-50 border border-amber-200 p-3">
+          <p class="font-medium text-amber-900">{{ emergency.unlinked_contacts }} contact(s) could not be linked:</p>
+          <ul class="mt-1 list-disc pl-5 text-amber-800 text-xs space-y-0.5">
+            {% for u in emergency.unlinked %}
+            <li>{{ u.publisher }} &mdash; {{ u.contacts }} contact(s); {{ u.reason }}</li>
+            {% endfor %}
+          </ul>
+          <p class="mt-2 text-xs text-amber-800">Give these persons distinct names in New World Scheduler to link them.</p>
+        </div>
+        {% endif %}
+        {% endif %}
+        <div class="flex flex-wrap items-center gap-3 pt-1">
+          <input id="emergencyFile" type="file" accept=".csv" class="text-sm" />
+          <button type="button" onclick="uploadEmergency()"
+                  class="px-4 py-2 rounded-xl font-semibold text-sm text-white bg-amber-500 hover:bg-amber-600 transition">
+            Upload
+          </button>
+          {% if emergency_exists %}
+          <button type="button" onclick="deleteEmergency()"
+                  class="text-red-400 hover:text-red-600 font-medium transition-colors">Remove</button>
+          {% endif %}
+        </div>
+        <p id="emergencyStatus" class="text-xs text-gray-500"></p>
+      </div>
+    </div>
+
     <!-- API keys (MCP endpoint) -->
     <div id="api-keys" class="bg-white rounded-2xl shadow-lg overflow-hidden">
       <div class="px-6 py-4 border-b border-gray-100">
@@ -263,6 +310,26 @@
     </div>
 
   </div>
+
+  <script>
+    async function uploadEmergency() {
+      const input = document.getElementById('emergencyFile');
+      const status = document.getElementById('emergencyStatus');
+      if (!input.files.length) { status.textContent = 'Choose Emergency-Contacts.csv first.'; return; }
+      const form = new FormData();
+      form.append('file', input.files[0]);
+      status.textContent = 'Uploading…';
+      const res = await fetch('/upload?emergency_contacts', { method: 'POST', body: form });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok) { location.hash = 'emergency'; location.reload(); }
+      else status.textContent = body.detail || ('Upload failed (' + res.status + ')');
+    }
+    async function deleteEmergency() {
+      if (!confirm('Remove the emergency contacts? They disappear from the directory until uploaded again.')) return;
+      const res = await fetch('/upload/emergency_contacts', { method: 'DELETE' });
+      if (res.ok) location.reload();
+    }
+  </script>
 
   <script>
     function copyNewKey(btn) {

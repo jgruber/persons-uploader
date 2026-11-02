@@ -27,6 +27,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import Environment, FileSystemLoader
+import emergency
 import history
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -352,6 +353,17 @@ CREATE TABLE IF NOT EXISTS tags (
 CREATE INDEX IF NOT EXISTS idx_tags_pid  ON tags(person_id);
 CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name);
 CREATE INDEX IF NOT EXISTS idx_persons_name ON persons(last_name, first_name);
+CREATE TABLE IF NOT EXISTS emergency_contacts (
+  id             INTEGER PRIMARY KEY,
+  person_id      INTEGER NOT NULL REFERENCES persons(id),
+  contact_order  INTEGER NOT NULL,
+  name           TEXT,
+  relationship   TEXT,
+  email          TEXT,
+  mobile         TEXT,
+  phone          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_emergency_person ON emergency_contacts(person_id, contact_order);
 """
 
 
@@ -575,6 +587,18 @@ def _csv_to_sqlite(csv_path: Path) -> str:
     placeholders = ",".join(["?"] * 71)
     cur.executemany(f"INSERT OR REPLACE INTO persons VALUES ({placeholders})", persons_rows)
     cur.executemany("INSERT INTO tags VALUES (?,?,?,?)", tags)
+
+    # Emergency contacts, linked to the persons above (see emergency.py). Notes are never stored.
+    contacts_path = UPLOAD_DIR / emergency.FILENAME
+    if contacts_path.exists():
+        linked, _ = emergency.link(raw, contacts_path.read_bytes())
+        known = {r[0] for r in persons_rows}
+        cur.executemany(
+            "INSERT INTO emergency_contacts (person_id, contact_order, name, relationship, email, "
+            "mobile, phone) VALUES (?,?,?,?,?,?,?)",
+            [(c["person_id"], c["contact_order"], c["name"], c["relationship"], c["email"],
+              c["mobile"], c["phone"]) for c in linked if c["person_id"] in known],
+        )
     conn.commit()
     conn.close()
     return tmp.name
@@ -588,7 +612,7 @@ API_KEY_SCOPES = {
     "contact": "Phone and email",
     "address": "Street address, city and ZIP",
     "contact_details": "All contact details: every phone, email and address, birth, baptism, "
-                       "appointment, pioneer and removal dates, and personal circumstances",
+                       "appointment, pioneer and removal dates, personal circumstances, and emergency contacts",
     "extended_attributes": "How each person is used: meeting parts, assignments and hall duties",
 }
 
@@ -800,13 +824,13 @@ def _add_csv_extras(db_path: str, csv_path: Path) -> None:
 
 
 # Bump when the MCP DB layout changes, so caches built by an older release are rebuilt
-_MCP_DB_VERSION = 2
+_MCP_DB_VERSION = 3
 
 
 def _mcp_sources_signature() -> str:
     """Changes whenever Persons.csv or any tag file is replaced, added or deleted."""
     parts = [f"v{_MCP_DB_VERSION}"]
-    for path in [UPLOAD_DIR / "Persons.csv", *_tag_files()]:
+    for path in [UPLOAD_DIR / "Persons.csv", UPLOAD_DIR / emergency.FILENAME, *_tag_files()]:
         try:
             st = path.stat()
         except FileNotFoundError:  # deleted since the listing
@@ -971,8 +995,8 @@ def search_persons(
 def get_person(person_id: int) -> dict:
     """Get one person's details: family, group and tags. Depending on this API key's scopes it
     also includes phone and email (contact), address (address), or every phone, email and address
-    plus birth, baptism, appointment, pioneer and removal dates and personal circumstances
-    (contact_details)."""
+    plus birth, baptism, appointment, pioneer and removal dates, personal circumstances and
+    emergency contacts (contact_details)."""
     _log_call("get_person", person_id=person_id)
     scopes = _mcp_scopes()
     with closing(_mcp_db()) as conn:
@@ -981,6 +1005,9 @@ def get_person(person_id: int) -> dict:
             raise ToolError(f"No person with id {person_id}.")
         person = _person_summaries(conn, [row])[0]
         extras = conn.execute("SELECT * FROM person_extras WHERE person_id = ?", (person_id,)).fetchone()
+        contacts = conn.execute(
+            "SELECT contact_order, name, relationship, email, mobile, phone FROM emergency_contacts "
+            "WHERE person_id = ? ORDER BY contact_order", (person_id,)).fetchall()
     person["first_name"] = row["first_name"]
     person["last_name"] = row["last_name"]
     person["family_head"] = bool(row["family_head"])
@@ -1008,6 +1035,12 @@ def get_person(person_id: int) -> dict:
         person["blind"] = bool(row["bind"])
         person["deaf"] = bool(row["deaf"])
         person["child"] = bool(row["child"])
+        person["emergency_contacts"] = [
+            {"order": c["contact_order"], "name": c["name"] or None,
+             "relationship": c["relationship"] or None, "email": c["email"] or None,
+             "mobile": c["mobile"] or None, "phone": c["phone"] or None}
+            for c in contacts
+        ]
     return person
 
 
@@ -1310,6 +1343,7 @@ app.router.routes.append(Route("/mcp", endpoint=_MCPKeyAuth()))
 def _file_state() -> dict:
     return {
         "persons_exists": (UPLOAD_DIR / "Persons.csv").exists(),
+        "emergency_exists": (UPLOAD_DIR / emergency.FILENAME).exists(),
         "tag_files": sorted(f.name for f in UPLOAD_DIR.glob("*.json")),
     }
 
@@ -1323,7 +1357,13 @@ async def index(request: Request, user: dict = Depends(require_auth)):
 async def upload(
     file: UploadFile = File(...),
     user: dict = Depends(require_upload),
+    emergency_contacts: Optional[str] = Query(default=None),
 ):
+    """`/upload` takes Persons.csv; `/upload?emergency_contacts` takes Emergency-Contacts.csv.
+
+    Each checks the file's columns, so the wrong file at either URL is refused
+    rather than overwriting the other.
+    """
     filename = file.filename or ""
     if not filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are accepted.")
@@ -1334,6 +1374,14 @@ async def upload(
         raise HTTPException(status_code=400, detail=f"Invalid content type: {content_type}")
 
     contents = await file.read()
+    if emergency_contacts is not None:
+        return await _upload_emergency_contacts(contents)
+    if not emergency.looks_like_persons(contents):
+        hint = (" That looks like Emergency-Contacts.csv - upload it to /upload?emergency_contacts."
+                if emergency.looks_like_contacts(contents) else "")
+        raise HTTPException(status_code=400, detail=(
+            "That is not a Persons.csv export (it needs PersonID, FirstName and LastName columns)."
+            + hint))
     (UPLOAD_DIR / "Persons.csv").write_bytes(contents)
 
     # Record the night's changes. A failure here must not lose the upload itself.
@@ -1347,6 +1395,47 @@ async def upload(
         message += (" Change history: baseline recorded." if recorded.get("baseline")
                     else f" Change history: {recorded['changes']} change(s) recorded.")
     return JSONResponse({"message": message, "history": recorded})
+
+
+async def _upload_emergency_contacts(contents: bytes) -> JSONResponse:
+    if not emergency.looks_like_contacts(contents):
+        hint = (" That looks like Persons.csv - upload it to /upload."
+                if emergency.looks_like_persons(contents) else "")
+        raise HTTPException(status_code=400, detail=(
+            "That is not an Emergency-Contacts.csv export (it needs PublisherID, PublisherFirstName, "
+            "PublisherLastName, Order and Name columns)." + hint))
+    kept, rows = emergency.sanitize(contents)          # Notes are dropped here, before disk
+    (UPLOAD_DIR / emergency.FILENAME).write_bytes(kept)
+    message = f"Emergency-Contacts.csv saved ({rows} contacts; notes are not kept)."
+    report = _emergency_report()
+    if report:
+        message += (f" {report['linked']} linked to {report['persons']} persons"
+                    + (f"; {report['unlinked_contacts']} could not be linked - see Admin."
+                       if report["unlinked"] else "."))
+    return JSONResponse({"message": message, "emergency_contacts": report})
+
+
+def _emergency_report() -> Optional[dict]:
+    """How the stored contacts link to the stored persons, or None when either is missing."""
+    persons, contacts = UPLOAD_DIR / "Persons.csv", UPLOAD_DIR / emergency.FILENAME
+    if not (persons.exists() and contacts.exists()):
+        return None
+    linked, unlinked = emergency.link(persons.read_bytes(), contacts.read_bytes())
+    return {
+        "linked": len(linked),
+        "persons": len({c["person_id"] for c in linked}),
+        "unlinked": unlinked,
+        "unlinked_contacts": sum(u["contacts"] for u in unlinked),
+    }
+
+
+@app.delete("/upload/emergency_contacts")
+async def delete_emergency_contacts(user: dict = Depends(require_upload)):
+    dest = UPLOAD_DIR / emergency.FILENAME
+    if not dest.exists():
+        raise HTTPException(status_code=404, detail="Emergency-Contacts.csv not found.")
+    dest.unlink()
+    return JSONResponse({"message": "Emergency-Contacts.csv deleted."})
 
 
 @app.post("/upload/tags")
@@ -1405,7 +1494,21 @@ _NO_CACHE_HEADERS = {
 async def download(
     user: dict = Depends(require_auth),
     tags: Optional[str] = Query(default=None),
+    emergency_contacts: Optional[str] = Query(default=None),
 ):
+    if emergency_contacts is not None:
+        persons, contacts = UPLOAD_DIR / "Persons.csv", UPLOAD_DIR / emergency.FILENAME
+        if not contacts.exists():
+            raise HTTPException(status_code=404, detail="Emergency-Contacts.csv has not been uploaded yet.")
+        if not persons.exists():
+            raise HTTPException(status_code=404, detail="Persons.csv has not been uploaded yet.")
+        linked, _ = emergency.link(persons.read_bytes(), contacts.read_bytes())
+        return JSONResponse(
+            linked,
+            headers={**_NO_CACHE_HEADERS,
+                     "Content-Disposition": 'attachment; filename="emergency-contacts.json"'},
+        )
+
     if tags is not None:
         tag_files = sorted(UPLOAD_DIR.glob("*.json"))
         if not tag_files:
@@ -1491,6 +1594,8 @@ def _render_admin(request: Request, user: dict, error=None, success=None, new_ke
         "users": _users,
         "api_keys": sorted(_api_keys.values(), key=lambda k: k["created"]),
         "scope_labels": API_KEY_SCOPES,
+        "emergency_exists": (UPLOAD_DIR / emergency.FILENAME).exists(),
+        "emergency": _emergency_report(),
         "new_key": new_key,
         "today": datetime.now(timezone.utc).date().isoformat(),
         "error": error,

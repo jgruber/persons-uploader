@@ -11,6 +11,8 @@ A web-based file management service for uploading and sharing `Persons.csv` and 
 - Download files (with no-cache headers for always-fresh data)
 - Role-based access: **Uploaders** (full access) and **Viewers** (download only)
 - User management admin panel
+- Emergency contacts from `Emergency-Contacts.csv` (`POST /upload?emergency_contacts`), linked to
+  persons in an `emergency_contacts` table - see [Emergency contacts](#emergency-contacts)
 - Monthly change history: every upload is compared with the last, and what changed among the
   persons (added, moved, removed, appointments, baptisms, activity, group, address, phone, anointed)
   is kept for 48 months - see [Change history](#change-history)
@@ -76,6 +78,9 @@ uvicorn main:app --reload
 | `DELETE` | `/upload/tags/{filename}` | Uploader | Delete a tag file |
 | `GET` | `/download` | Any | Download `Persons.csv` |
 | `GET` | `/download?tags` | Any | Download combined `tags.json` |
+| `POST` | `/upload?emergency_contacts` | Uploader | Upload `Emergency-Contacts.csv` (notes dropped) |
+| `DELETE` | `/upload/emergency_contacts` | Uploader | Delete the emergency contacts |
+| `GET` | `/download?emergency_contacts` | Any | Emergency contacts linked to persons (JSON) |
 | `GET` | `/admin` | Uploader | User management |
 | `POST` | `/admin/users/add` | Uploader | Create user |
 | `POST` | `/admin/users/{username}/delete` | Uploader | Delete user |
@@ -87,6 +92,28 @@ uvicorn main:app --reload
 | `POST` | `/mcp` | API key | MCP endpoint (streamable HTTP) |
 | `GET` | `/changes?month=YYYY-MM` | Any | Monthly changes page |
 | `GET` | `/changes/report?month=YYYY-MM&format=pdf\|md\|json` | Any | Monthly changes download |
+
+## Emergency contacts
+
+`POST /upload?emergency_contacts` takes the New World Scheduler `Emergency-Contacts.csv`. Only each
+contact's name, relationship, email, mobile and phone are kept, in the export's `Order`; **the
+Notes column is dropped before the file is written**. Each upload URL checks the file's columns,
+so `Persons.csv` and `Emergency-Contacts.csv` can never overwrite one another.
+
+The export's `PublisherID` is mostly a different numbering from `PersonID`, so a contact's person
+is found by `PublisherID` when it is a PersonID with the same name, otherwise by a unique first +
+last name. People who share a name are listed on the Admin page instead of guessed, and exact
+repeats (one person exported under two PublisherIDs) are kept once.
+
+```sql
+SELECT p.display_name, e.contact_order, e.name, e.relationship, e.mobile, e.phone, e.email
+  FROM emergency_contacts e JOIN persons p ON p.id = e.person_id
+ ORDER BY p.last_name, p.first_name, e.contact_order;
+```
+
+The table is in `/download/database`; `GET /download?emergency_contacts` returns the linked contacts
+as JSON for congregation-directory; agents get them in `get_person` with the `contact_details`
+scope.
 
 ## Change history
 
